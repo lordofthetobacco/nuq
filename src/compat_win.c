@@ -411,7 +411,7 @@ static HANDLE dup_inheritable(HANDLE h)
 }
 
 /* Starts a process that inherits exactly the given standard handles and
- * nothing else (a lock file or a nanomsg pipe must never leak into tmux or
+ * nothing else (a lock file or a bus pipe must never leak into tmux or
  * the broker). Any of in/out/err may be NULL. */
 static int start_process(const char *const argv[], HANDLE in, HANDLE out, HANDLE err, DWORD flags,
                          PROCESS_INFORMATION *pi)

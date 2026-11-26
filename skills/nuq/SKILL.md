@@ -93,7 +93,7 @@ nuq -d --sub review,build codex         # subscribe it to topics from the start
   sent early is kept and delivered once the agent is ready.
 - The first agent started is the main one: it keeps the left half of the
   grid, and the rest stack on the right.
-- `nuq kill NAME` stops one agent. `nuq down` stops the whole grid,
+- `nuq kill NAME` stops one agent. `nuq nuke` stops the whole grid,
   including agents the user started, so ask before running it.
 
 ## Sending

@@ -3,10 +3,10 @@
 
 #include <stddef.h>
 
-/* Thin wrapper over nanomsg. bus.c is the only file that includes nn.h, so
- * moving to NNG later means rewriting one file.
+/* Thin wrapper over NNG. bus.c is the only file that includes nng.h, so
+ * changing the transport library means rewriting one file.
  *
- * nanomsg starts worker threads on the first socket and they do not survive
+ * NNG starts worker threads on the first socket and they do not survive
  * fork(): never call these between fork() and exec(). */
 
 #define BUS_DONTWAIT 1

@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-option(NUQ_SYSTEM_NANOMSG "Link an installed nanomsg instead of building the pinned copy" OFF)
+option(NUQ_SYSTEM_NNG "Link an installed NNG 2.x instead of building the pinned copy" OFF)
 option(NUQ_SANITIZE "Build nuq with AddressSanitizer and UBSan" OFF)
 option(NUQ_TESTS "Build the test suite" ON)
 
@@ -13,7 +13,7 @@ option(NUQ_TESTS "Build the test suite" ON)
 # the Visual C++ redistributable and inside panes whatever their PATH.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-include(cmake/Nanomsg.cmake)
+include(cmake/Nng.cmake)
 
 if(WIN32)
   # Native Windows has no curses; PDCursesMod (wincon port) stands in.
@@ -97,7 +97,7 @@ target_compile_definitions(nuq_core PUBLIC
   ${NQ_PLATFORM_DEFS}
   NQ_VERSION="${PROJECT_VERSION}")
 target_compile_options(nuq_core PRIVATE ${NQ_WARN_FLAGS})
-target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} nuq_manifest PRIVATE nuq_nanomsg)
+target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} nuq_manifest PRIVATE nuq_nng)
 if(CURSES_INCLUDE_DIRS)
   target_include_directories(nuq_core SYSTEM PRIVATE ${CURSES_INCLUDE_DIRS})
 endif()

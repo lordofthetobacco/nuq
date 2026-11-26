@@ -47,12 +47,12 @@ export XDG_CONFIG_HOME="$T/config"
 export CLAUDE_CONFIG_DIR="$T/claude-config" CODEX_HOME="$T/codex-home"
 export NUQ_TMUX_SOCKET="nqt$$"
 export FAKE_AGENT_LOG="$T/agent.log"
-unset NUQ_DIR NUQ_AGENT TMUX TMUX_PANE
+unset NUQ_DIR NUQ_AGENT NUQ_TOKEN TMUX TMUX_PANE
 
 cd "$PROJ" || exit 1
 
 cleanup() {
-    "$NQ" down >/dev/null 2>&1
+    "$NQ" nuke >/dev/null 2>&1
     tmux -L "$NUQ_TMUX_SOCKET" kill-server >/dev/null 2>&1
     # grid.sh plays the user's terminal with a second server.
     tmux -L "${NUQ_TMUX_SOCKET}o" kill-server >/dev/null 2>&1

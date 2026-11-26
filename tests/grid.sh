@@ -108,23 +108,53 @@ if [ -n "$NQ_WIN" ]; then
 else
     term new-session -d -s ui -x 120 -y 34 "$ui_cmd"
 fi
-waitfor 'screen | grep -q "Message flow"' "the UI to open"
+waitfor 'screen | grep -q "Agent terminal"' "the UI to open"
 [ "$(clients)" = 0 ] || fail "launching should not attach to tmux"
 
 step "the roster, narrow layout, and help stay usable"
-waitfor 'screen | grep -q "one / fake_agent.sh"' "the first agent's details"
+waitfor 'screen | grep -q "Agent terminal / one"' "the first agent's details"
+screen | grep -q "fake_agent.sh" || fail "the tile should show the agent's kind"
 term send-keys -t ui Down
-waitfor 'screen | grep -q "two / fake_tui"' "selection to update the details"
+waitfor 'screen | grep -q "Agent terminal / two"' "selection to update the details"
 term resize-window -t ui -x 58 -y 22
-waitfor 'screen | grep "Message flow" | grep -qv "Agents"' "message flow in the stacked layout"
-term send-keys -t ui '?'
+waitfor 'screen | grep "Agent terminal" | grep -qv "Agents"' "agent terminal in the stacked layout"
+term send-keys -t ui F1
 waitfor 'screen | grep -q ":send N|name|all text"' "help commands"
 term send-keys -t ui Escape
-waitfor 'screen | grep -q "two / fake_tui"' "selection to survive resize and help"
+waitfor 'screen | grep -q "Agent terminal / two"' "selection to survive resize and help"
 term resize-window -t ui -x 120 -y 34
 # PDCurses (Windows) throws away keys typed while it handles a resize, so
 # type only once the wide layout is back.
-waitfor 'screen | grep "Message flow" | grep -q "Agents"' "the wide layout to return"
+waitfor 'screen | grep "Agent terminal" | grep -q "Agents"' "the wide layout to return"
+
+step "the agent tile is display only: typing never reaches the agent"
+waitfor 'screen | grep -q "fake tui ready"' "the selected agent's live output"
+term send-keys -t ui -l -- 'xyzzy'
+if [ -z "$NQ_WIN" ]; then
+    # Dropping a paste needs bracketed paste. PDCurses (Windows) has none:
+    # a paste arrives there as key presses, shortcuts included.
+    printf 'pasted line' | term load-buffer -
+    term paste-buffer -p -d -t ui
+fi
+sleep 1
+hasnt "$(screen)" "xyzzy" "the agent tile (typed text)"
+hasnt "$(screen)" "pasted line" "the agent tile (pasted text)"
+hasnt "$(cat "$FAKE_AGENT_LOG" 2>/dev/null)" "xyzzy" "the agent input"
+[ "$(clients)" = 0 ] || fail "typing should keep the dashboard open"
+
+step "the bottom panel switches to a shell in the project directory"
+term send-keys -t ui Tab
+waitfor 'screen | grep -q "i type"' "the terminal tab"
+term send-keys -t ui i
+waitfor 'screen | grep -q "Terminal (typing)"' "typing mode"
+term send-keys -t ui -l -- 'echo shell-$((6*7))'
+term send-keys -t ui Enter
+waitfor 'screen | grep -q "shell-42"' "the shell to run the command"
+term send-keys -t ui F12
+waitfor 'screen | grep -q "i type"' "F12 to stop typing"
+hasnt "$(cat "$FAKE_AGENT_LOG" 2>/dev/null)" "shell-" "the agent input"
+term send-keys -t ui Tab
+waitfor 'screen | grep -q "Tab terminal"' "the changed-files tab"
 
 step ":takeover shows the agent full screen; F12 and Ctrl-q come back"
 term send-keys -t ui ':takeover ui' Enter
@@ -157,7 +187,7 @@ fi
 step ":q leaves the UI and the agents keep running"
 # The UI drops keys typed while it is coming back, so wait for it first.
 sleep 1
-waitfor 'screen | grep -q "Message flow"' "the UI to be back"
+waitfor 'screen | grep -q "Agent terminal"' "the UI to be back"
 term send-keys -t ui ':q' Enter
 waitfor 'screen | grep -q UI-EXITED' "the UI to exit"
 "$NQ" ls | grep -q "^ui " || fail "ui should still be running"
@@ -212,13 +242,13 @@ step "kill stops one agent"
 waitfor '[ "$(panes)" = 1 ]' "two's pane to close"
 hasnt "$("$NQ" ls)" "two "
 
-step "down ends the grid"
-"$NQ" down >/dev/null || fail "down"
+step "nuke ends the grid"
+"$NQ" nuke >/dev/null || fail "nuke"
 tm has-session 2>/dev/null && fail "the tmux session should be gone"
 out=$("$NQ" ls 2>&1) && fail "the broker should be gone"
 
 step "the grid can be started again and remembers people, not panes"
-# The same name straight after `down`: the old pane's wrapper may still be
+# The same name straight after `nuke`: the old pane's wrapper may still be
 # saying goodbye, and that must not unregister the new agent.
 "$NQ" --inject -n risky "$FAKE_AGENT" </dev/null >/dev/null || fail "relaunch"
 waitfor '"$NQ" ls | grep "^risky" | grep -q "%"' "the new risky to register"

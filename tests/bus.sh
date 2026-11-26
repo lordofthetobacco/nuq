@@ -102,7 +102,7 @@ n=$(as alice "$NQ" inbox | grep -c '^burst ')
 
 step "state survives a broker restart"
 as bob "$NQ" send @alice keep me >/dev/null
-"$NQ" down >/dev/null
+"$NQ" nuke >/dev/null
 out=$("$NQ" ls 2>&1) && fail "broker should be down"
 "$NQ" up >/dev/null || fail "restart"
 has "$(as alice "$NQ" inbox)" "keep me"

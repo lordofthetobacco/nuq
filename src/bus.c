@@ -1,44 +1,51 @@
 #include "bus.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <sddl.h>
+#include <stdio.h>
 #else
 #include <poll.h>
 #endif
 
-#ifdef NQ_NN_INSTALLED_HEADERS
-#include <nanomsg/nn.h>
-#include <nanomsg/pubsub.h>
-#include <nanomsg/reqrep.h>
-#else
-#include "nn.h"
-#include "pubsub.h"
-#include "reqrep.h"
-#endif
-#ifdef _WIN32
-#ifdef NQ_NN_INSTALLED_HEADERS
-#include <nanomsg/ipc.h>
-#else
-#include "ipc.h"
-#endif
-#endif
+#include <nng/nng.h>
 
 #include "util.h"
 
-#ifdef _WIN32
-/* nanomsg's ipc:// is a named pipe, which by default every local account
- * may open for reading. Only this user (and SYSTEM) may use ours, the way the
- * private runtime directory guards the Unix sockets. nanomsg keeps the
- * pointer, so the attributes live as long as the process. */
-static SECURITY_ATTRIBUTES *pipe_security(void)
+/* NNG reports errors as return values, not through errno. The last failure
+ * is kept here so bus_error() can describe it the way nn_errno() did. */
+static nng_err last_err;
+
+static int fail(int rv)
 {
-    static SECURITY_ATTRIBUTES sa;
+    last_err = (nng_err)rv;
+    return -1;
+}
+
+#ifdef _WIN32
+/* The broker's endpoints are named pipes on Windows. NNG calls those
+ * winpipe://; its ipc:// is a Unix socket file there, which the access
+ * control below would not cover. Callers keep saying ipc://. */
+static const char *pipe_url(const char *url, char *buf, size_t len)
+{
+    if (strncmp(url, "ipc://", 6) != 0) return url;
+    snprintf(buf, len, "winpipe://%s", url + 6);
+    return buf;
+}
+
+/* A named pipe may by default be opened for reading by every local account.
+ * Only this user (and SYSTEM) may use ours, the way the private runtime
+ * directory guards the Unix sockets. NNG keeps the pointer, so the
+ * descriptor lives as long as the process. */
+static PSECURITY_DESCRIPTOR pipe_security(void)
+{
+    static PSECURITY_DESCRIPTOR sd;
     static int done;
-    if (done) return sa.lpSecurityDescriptor ? &sa : NULL;
+    if (done) return sd;
     done = 1;
     HANDLE tok;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return NULL;
@@ -55,60 +62,86 @@ static SECURITY_ATTRIBUTES *pipe_security(void)
     char sddl[256];
     snprintf(sddl, sizeof sddl, "D:P(A;;GA;;;%s)(A;;GA;;;SY)", sid);
     LocalFree(sid);
-    PSECURITY_DESCRIPTOR sd = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, NULL)) return NULL;
-    sa.nLength = sizeof sa;
-    sa.lpSecurityDescriptor = sd;
-    sa.bInheritHandle = FALSE;
-    return &sa;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, NULL)) sd = NULL;
+    return sd;
 }
 #endif
 
-static int bind_socket(int proto, const char *url)
+/* NNG sockets are structs holding a positive id. The id is what callers see
+ * as the socket number, so the bus API keeps using plain ints. */
+static nng_socket sock_of(int id)
 {
-    int s = nn_socket(AF_SP, proto);
-    if (s < 0) return -1;
-    /* A vanished peer must never be able to stall the broker. */
-    int to = 1000;
-    nn_setsockopt(s, NN_SOL_SOCKET, NN_SNDTIMEO, &to, sizeof to);
-#ifdef _WIN32
-    SECURITY_ATTRIBUTES *sa = pipe_security();
-    if (!sa || nn_setsockopt(s, NN_IPC, NN_IPC_SEC_ATTR, sa, sizeof *sa) < 0) {
-        nn_close(s);
-        return -1;
-    }
-#endif
-    if (nn_bind(s, url) < 0) {
-        nn_close(s);
-        return -1;
-    }
+    nng_socket s = NNG_SOCKET_INITIALIZER;
+    s.id = (uint32_t)id;
     return s;
+}
+
+/* NNG must be initialised before any other call. nng_init() may be called
+ * again later, but once is enough for a process. */
+static int lib_init(void)
+{
+    static int done;
+    if (done) return 0;
+    int rv = nng_init(NULL);
+    if (rv != 0) return fail(rv);
+    done = 1;
+    return 0;
+}
+
+static int open_socket(int (*open_fn)(nng_socket *), nng_socket *s)
+{
+    if (lib_init() < 0) return -1;
+    int rv = open_fn(s);
+    return rv != 0 ? fail(rv) : 0;
+}
+
+static int bind_socket(int (*open_fn)(nng_socket *), const char *url)
+{
+    nng_socket s;
+    if (open_socket(open_fn, &s) < 0) return -1;
+    /* A vanished peer must never be able to stall the broker. */
+    nng_socket_set_ms(s, NNG_OPT_SENDTIMEO, 1000);
+#ifdef _WIN32
+    char pipe[256];
+    nng_listener l;
+    PSECURITY_DESCRIPTOR sd = pipe_security();
+    int rv = sd ? nng_listener_create(&l, s, pipe_url(url, pipe, sizeof pipe)) : NNG_EPERM;
+    if (rv == 0) rv = nng_listener_set_security_descriptor(l, sd);
+    if (rv == 0) rv = nng_listener_start(l, 0);
+#else
+    int rv = nng_listen(s, url, NULL, 0);
+#endif
+    if (rv != 0) {
+        nng_socket_close(s);
+        return fail(rv);
+    }
+    return nng_socket_id(s);
 }
 
 int bus_rep_bind(const char *url)
 {
-    return bind_socket(NN_REP, url);
+    return bind_socket(nng_rep0_open, url);
 }
 
 int bus_pub_bind(const char *url)
 {
-    return bind_socket(NN_PUB, url);
+    return bind_socket(nng_pub0_open, url);
 }
 
 int bus_rcvfd(int sock)
 {
     int fd = -1;
-    size_t len = sizeof fd;
-    if (nn_getsockopt(sock, NN_SOL_SOCKET, NN_RCVFD, &fd, &len) < 0) return -1;
-    return fd;
+    int rv = nng_socket_get_recv_poll_fd(sock_of(sock), &fd);
+    return rv != 0 ? fail(rv) : fd;
 }
 
 int bus_wait(int sock, int timeout_ms)
 {
 #ifdef _WIN32
-    SOCKET fd;
-    size_t len = sizeof fd;
-    if (nn_getsockopt(sock, NN_SOL_SOCKET, NN_RCVFD, &fd, &len) < 0) return -1;
+    /* NNG's descriptor is a loopback SOCKET here, which only select() takes. */
+    int rcv = bus_rcvfd(sock);
+    if (rcv < 0) return -1;
+    SOCKET fd = (SOCKET)rcv;
     fd_set rd;
     FD_ZERO(&rd);
     FD_SET(fd, &rd);
@@ -124,63 +157,77 @@ int bus_wait(int sock, int timeout_ms)
 
 int bus_set_rcvtimeo(int sock, int timeout_ms)
 {
-    return nn_setsockopt(sock, NN_SOL_SOCKET, NN_RCVTIMEO, &timeout_ms, sizeof timeout_ms);
+    int rv = nng_socket_set_ms(sock_of(sock), NNG_OPT_RECVTIMEO, timeout_ms);
+    return rv != 0 ? fail(rv) : 0;
 }
 
-static int connect_socket(int proto, const char *url, int timeout_ms)
+static int connect_socket(int (*open_fn)(nng_socket *), const char *url, int timeout_ms)
 {
-    int s = nn_socket(AF_SP, proto);
-    if (s < 0) return -1;
-    /* Replies can carry a whole inbox; the 1 MiB default would truncate. */
-    int unlimited = -1;
-    nn_setsockopt(s, NN_SOL_SOCKET, NN_RCVMAXSIZE, &unlimited, sizeof unlimited);
+    nng_socket s;
+    if (open_socket(open_fn, &s) < 0) return -1;
+    /* Replies can carry a whole inbox; never cap their size. Must be set
+     * before dialing, since dialers copy it when they are created. */
+    nng_socket_set_size(s, NNG_OPT_RECVMAXSZ, 0);
     if (timeout_ms >= 0) {
-        nn_setsockopt(s, NN_SOL_SOCKET, NN_SNDTIMEO, &timeout_ms, sizeof timeout_ms);
-        nn_setsockopt(s, NN_SOL_SOCKET, NN_RCVTIMEO, &timeout_ms, sizeof timeout_ms);
+        nng_socket_set_ms(s, NNG_OPT_SENDTIMEO, timeout_ms);
+        nng_socket_set_ms(s, NNG_OPT_RECVTIMEO, timeout_ms);
     }
-    if (nn_connect(s, url) < 0) {
-        nn_close(s);
-        return -1;
+    /* Non-blocking dial: like nn_connect, succeed even when the broker is
+     * not listening yet and keep reconnecting in the background. */
+#ifdef _WIN32
+    char pipe[256];
+    url = pipe_url(url, pipe, sizeof pipe);
+#endif
+    int rv = nng_dial(s, url, NULL, NNG_FLAG_NONBLOCK);
+    if (rv != 0) {
+        nng_socket_close(s);
+        return fail(rv);
     }
-    return s;
+    return nng_socket_id(s);
 }
 
 int bus_req_connect(const char *url, int timeout_ms)
 {
-    return connect_socket(NN_REQ, url, timeout_ms);
+    return connect_socket(nng_req0_open, url, timeout_ms);
 }
 
 int bus_sub_connect(const char *url)
 {
-    return connect_socket(NN_SUB, url, -1);
+    return connect_socket(nng_sub0_open, url, -1);
 }
 
 int bus_sub_add(int sock, const char *prefix)
 {
-    return nn_setsockopt(sock, NN_SUB, NN_SUB_SUBSCRIBE, prefix, strlen(prefix));
+    int rv = nng_sub0_socket_subscribe(sock_of(sock), prefix, strlen(prefix));
+    return rv != 0 ? fail(rv) : 0;
 }
 
 char *bus_recv(int sock, int flags, size_t *len)
 {
-    void *buf = NULL;
-    int n = nn_recv(sock, &buf, NN_MSG, (flags & BUS_DONTWAIT) ? NN_DONTWAIT : 0);
-    if (n < 0) return NULL;
-    char *out = xmalloc((size_t)n + 1);
-    memcpy(out, buf, (size_t)n);
+    nng_msg *msg = NULL;
+    int rv = nng_recvmsg(sock_of(sock), &msg, (flags & BUS_DONTWAIT) ? NNG_FLAG_NONBLOCK : 0);
+    if (rv != 0) {
+        fail(rv);
+        return NULL;
+    }
+    size_t n = nng_msg_len(msg);
+    char *out = xmalloc(n + 1);
+    memcpy(out, nng_msg_body(msg), n);
     out[n] = '\0';
-    nn_freemsg(buf);
-    if (len) *len = (size_t)n;
+    nng_msg_free(msg);
+    if (len) *len = n;
     return out;
 }
 
 int bus_send(int sock, const char *buf, size_t len, int flags)
 {
-    return nn_send(sock, buf, len, (flags & BUS_DONTWAIT) ? NN_DONTWAIT : 0) < 0 ? -1 : 0;
+    int rv = nng_send(sock_of(sock), (void *)buf, len, (flags & BUS_DONTWAIT) ? NNG_FLAG_NONBLOCK : 0);
+    return rv != 0 ? fail(rv) : 0;
 }
 
 void bus_close(int sock)
 {
-    if (sock >= 0) nn_close(sock);
+    if (sock >= 0) nng_socket_close(sock_of(sock));
 }
 
 char *bus_request(const char *url, const char *req, int timeout_ms)
@@ -195,5 +242,5 @@ char *bus_request(const char *url, const char *req, int timeout_ms)
 
 const char *bus_error(void)
 {
-    return nn_strerror(nn_errno());
+    return nng_strerror(last_err);
 }

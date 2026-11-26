@@ -16,7 +16,7 @@ int tmux_argv(av_t *args, const char *in, sb_t *out)
     const char *sock = getenv("NUQ_TMUX_SOCKET");
 #ifdef _WIN32
     /* Otherwise psmux keeps a spare "warm" server and pre-started shells,
-     * sitting in the grid directory: they outlive `nuq down` and keep the
+     * sitting in the grid directory: they outlive `nuq nuke` and keep the
      * directory from being deleted. Servers inherit this from the client
      * that starts them. */
     if (!getenv("PSMUX_NO_WARM")) nq_setenv("PSMUX_NO_WARM", "1");
@@ -100,9 +100,9 @@ int tmux_capture(const char *pane, sb_t *out)
 
 int tmux_paste(const char *pane, const char *text)
 {
-    /* One buffer per pane so concurrent wakes cannot swap their text. */
+    /* Separate dashboard and broker pastes, even when they target one pane. */
     char buf[64];
-    snprintf(buf, sizeof buf, "nuq-%s", pane[0] == '%' ? pane + 1 : pane);
+    snprintf(buf, sizeof buf, "nuq-%ld-%s", (long)getpid(), pane[0] == '%' ? pane + 1 : pane);
     if (tmux(NULL, text, "load-buffer", "-b", buf, "-", NULL) != 0) return -1;
     /* -p: bracketed paste when the application asked for it, so newlines are
      * text and not Enter. -d: drop the buffer afterwards. Line feeds become
@@ -137,20 +137,36 @@ static void query(char *buf, size_t len, const char *target, const char *format)
     sb_free(&out);
 }
 
+/* Applies a layout unless the window is zoomed. The test runs inside the
+ * tmux server together with the layout, so a takeover that zooms a pane
+ * between our check and the layout cannot be undone by it. */
+static void select_layout(const char *window, const char *layout)
+{
+    char cmd[96];
+    snprintf(cmd, sizeof cmd, "select-layout -t %s %s", window, layout);
+    tmux(NULL, NULL, "if-shell", "-F", "-t", window, "#{window_zoomed_flag}", "", cmd, NULL);
+}
+
 static void main_vertical(const char *window)
 {
     tmux(NULL, NULL, "set-option", "-w", "-t", window, "main-pane-width", "50%", NULL);
-    tmux(NULL, NULL, "select-layout", "-t", window, "main-vertical", NULL);
+    select_layout(window, "main-vertical");
 }
 
-void tmux_layout(const char *session, const char *main_pane)
+int tmux_layout(const char *session, const char *main_pane)
 {
     char t[128], main_win[32] = "";
     exact(t, sizeof t, session);
     sb_t wins = {0};
+    if (tmux(&wins, NULL, "list-windows", "-t", t, "-F", "#{window_zoomed_flag}", NULL) == 0 && wins.p &&
+        strchr(wins.p, '1')) {
+        sb_free(&wins);
+        return -1;
+    }
+    sb_free(&wins);
     if (tmux(&wins, NULL, "list-windows", "-t", t, "-F", "#{window_id}", NULL) != 0 || !wins.p) {
         sb_free(&wins);
-        return;
+        return 0;
     }
     if (main_pane) query(main_win, sizeof main_win, main_pane, "#{window_id}");
     if (!main_win[0]) snprintf(main_win, sizeof main_win, "%.*s", (int)strcspn(wins.p, "\n"), wins.p);
@@ -172,9 +188,10 @@ void tmux_layout(const char *session, const char *main_pane)
         if (!strcmp(w, main_win))
             main_vertical(w);
         else
-            tmux(NULL, NULL, "select-layout", "-t", w, "tiled", NULL);
+            select_layout(w, "tiled");
     }
     sb_free(&wins);
+    return 0;
 }
 
 int tmux_main_window_full(const char *window)

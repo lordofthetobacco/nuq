@@ -217,6 +217,14 @@ static void codex_args(const char *self, av_t *av, av_t *owned)
 
     av_add(av, "-c");
     av_add(av, "features.hooks=true");
+    /* Run sandboxed without approval prompts: commands stay inside the
+     * workspace-write sandbox and a blocked one fails back to the model
+     * instead of stopping for a person. These are config overrides, not
+     * -a/-s flags, so a user's own --sandbox or -a still wins. */
+    av_add(av, "-c");
+    av_add(av, "approval_policy=\"never\"");
+    av_add(av, "-c");
+    av_add(av, "sandbox_mode=\"workspace-write\"");
     /* Codex's command sandbox blocks local sockets too, so without network
      * access the agent could receive messages but every `nuq send` it ran
      * would fail. Opening it is a deliberate choice made for nuq sessions;
