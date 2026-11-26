@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "store.h"
 
@@ -37,7 +39,7 @@ static char *keep(av_t *owned, char *s)
 
 static int write_private(const char *path, const char *text)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | NQ_O_BINARY, 0600);
     if (fd < 0) return -1;
     size_t len = strlen(text), off = 0;
     while (off < len) {
@@ -49,16 +51,59 @@ static int write_private(const char *path, const char *text)
     return off == len ? 0 : -1;
 }
 
+/* Appends the path of nuq as the start of a hook command. Returns 1 if
+ * the command needs PowerShell to run.
+ *
+ * On Windows, Claude Code runs hook commands with Git Bash (PowerShell when
+ * Git Bash is missing) and Codex runs them with PowerShell. A path made of
+ * plain characters means the same unquoted in both, so it goes in as it is.
+ * Any other path is quoted for PowerShell, and the Claude hook then asks for
+ * PowerShell explicitly. */
+static int add_self(sb_t *cmd, const char *self)
+{
+#ifdef _WIN32
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s", self);
+    nq_path_norm(path);
+    int plain = 1;
+    for (const char *p = path; *p; p++)
+        if (!strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:-", *p)) plain = 0;
+    if (plain) {
+        sb_adds(cmd, path);
+        return 0;
+    }
+    /* PowerShell also takes the typographic quotes U+2018..U+201B as single
+     * quotes; any of them is escaped by doubling it. */
+    sb_adds(cmd, "& '");
+    for (const char *p = path; *p; p++) {
+        sb_add(cmd, p, 1);
+        if (*p == '\'')
+            sb_add(cmd, p, 1);
+        else if (!strncmp(p, "\xE2\x80", 2) && p[2] >= '\x98' && p[2] <= '\x9B') {
+            sb_add(cmd, p + 1, 2);
+            sb_add(cmd, p, 3);
+            p += 2;
+        }
+    }
+    sb_adds(cmd, "'");
+    return 1;
+#else
+    sb_add_shq(cmd, self);
+    return 0;
+#endif
+}
+
 /* ---- Claude Code ------------------------------------------------------- */
 
 static cJSON *claude_command(const char *self, const char *event)
 {
     sb_t cmd = {0};
-    sb_add_shq(&cmd, self);
+    int powershell = add_self(&cmd, self);
     sb_addf(&cmd, " hook claude %s", event);
     cJSON *h = cJSON_CreateObject();
     cJSON_AddStringToObject(h, "type", "command");
     cJSON_AddStringToObject(h, "command", cmd.p);
+    if (powershell) cJSON_AddStringToObject(h, "shell", "powershell");
     sb_free(&cmd);
     return h;
 }
@@ -102,6 +147,11 @@ static char *claude_settings(const nq_ctx *c, const char *name, const char *self
         char rule[64];
         snprintf(rule, sizeof rule, "Bash(nuq %s:*)", verbs[i]);
         cJSON_AddItemToArray(allow, cJSON_CreateString(rule));
+#ifdef _WIN32
+        /* Claude Code on Windows also has a PowerShell tool. */
+        snprintf(rule, sizeof rule, "PowerShell(nuq %s:*)", verbs[i]);
+        cJSON_AddItemToArray(allow, cJSON_CreateString(rule));
+#endif
     }
 
     sb_t path = {0};
@@ -177,7 +227,7 @@ static void codex_args(const char *self, av_t *av, av_t *owned)
     sb_adds(&state, "hooks.state={ ");
     for (size_t i = 0; i < sizeof events / sizeof events[0]; i++) {
         sb_t cmd = {0};
-        sb_add_shq(&cmd, self);
+        add_self(&cmd, self);
         sb_addf(&cmd, " hook codex %s", events[i].event);
         char *quoted = json_quote(cmd.p);
 
@@ -189,8 +239,16 @@ static void codex_args(const char *self, av_t *av, av_t *owned)
 
         char hash[72];
         adapter_codex_hook_hash(events[i].key, cmd.p, CODEX_HOOK_TIMEOUT, NULL, hash);
+#ifdef _WIN32
+        /* Codex resolves the session-flags layer's synthetic path against
+         * C:\ on Windows (synthetic_layer_path() in discovery.rs), so the key
+         * reads C:\<session-flags>\config.toml there. */
+        sb_addf(&state, "%s\"C:\\\\<session-flags>\\\\config.toml:%s:0:0\" = { trusted_hash = \"%s\" }",
+                i ? ", " : "", events[i].key, hash);
+#else
         sb_addf(&state, "%s\"/<session-flags>/config.toml:%s:0:0\" = { trusted_hash = \"%s\" }",
                 i ? ", " : "", events[i].key, hash);
+#endif
         free(quoted);
         sb_free(&cmd);
     }
@@ -251,6 +309,10 @@ void adapter_bootstrap(sb_t *out, const char *me, const cJSON *agents)
             "(nuq fail ID -m reason gives it back)\n"
             "For text with several lines or quotes, pipe it in: "
             "nuq send @NAME <<'EOF' ... EOF\n"
+#ifdef _WIN32
+            "In PowerShell the commands are the same (inside 'text' write ' as ''); for several "
+            "lines pipe a here-string: @'<newline>...<newline>'@ | nuq send @NAME\n"
+#endif
             "\nSend a message only when it carries something the receiver needs. "
             "Do not send acknowledgements or thanks.\n");
 }

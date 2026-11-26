@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "adapters.h"
 #include "paths.h"
@@ -338,6 +340,59 @@ static void test_paths(const char *dir)
     CHECK(strlen(a.ev_url) - 6 < 104);
     CHECK(!strncmp(a.session, "nq-", 3) && !strchr(a.session, '.') && !strchr(a.session, ':'));
     CHECK(paths_init(&b, "/no/such/dir", err, sizeof err) < 0);
+#ifdef _WIN32
+    /* The broker's addresses are named pipes: one flat name, no path. */
+    CHECK(!strpbrk(a.rpc_url + 6, "/\\:") && !strpbrk(a.ev_url + 6, "/\\:"));
+    CHECK(strcmp(a.rpc_url, a.ev_url));
+    /* Any spelling of the directory is the same grid: backslashes, a
+     * lower-case drive letter, other letter case, a trailing separator. */
+    char alt[PATH_MAX];
+    snprintf(alt, sizeof alt, "%s\\", a.dir);
+    for (char *q = alt; *q; q++) {
+        if (*q == '/') *q = '\\';
+        else if (*q >= 'A' && *q <= 'Z') *q = (char)(*q - 'A' + 'a');
+    }
+    CHECK(paths_init(&b, alt, err, sizeof err) == 0);
+    CHECK(!strcmp(a.grid, b.grid) && !strcmp(a.dir, b.dir) && !strcmp(a.rpc_url, b.rpc_url));
+    /* The stored form: absolute, forward slashes, upper-case drive. */
+    CHECK(a.dir[0] >= 'A' && a.dir[0] <= 'Z' && a.dir[1] == ':' && a.dir[2] == '/' && !strchr(a.dir, '\\'));
+#endif
+}
+
+static void test_compat(const char *dir)
+{
+    CHECK(nq_is_abs("/x"));
+    CHECK(!nq_is_abs("x/y") && !nq_is_abs(""));
+    CHECK(!strcmp(nq_basename("a/b/c"), "c") && !strcmp(nq_basename("c"), "c"));
+    char real[PATH_MAX];
+    CHECK(nq_realpath(dir, real, sizeof real) == 0 && nq_is_abs(real));
+#ifdef _WIN32
+    CHECK(nq_is_abs("C:/x") && nq_is_abs("c:\\x") && nq_is_abs("//server/share/x"));
+    CHECK(!nq_is_abs("C:x"));
+    CHECK(!strcmp(nq_basename("C:\\a\\b.exe"), "b.exe") && !strcmp(nq_basename("a\\b/c"), "c"));
+    char p[] = "c:\\Users\\x/proj";
+    nq_path_norm(p);
+    CHECK(!strcmp(p, "C:/Users/x/proj"));
+    CHECK(nq_home() == NULL || (nq_is_abs(nq_home()) && !strchr(nq_home(), '\\')));
+
+    /* One holder of the broker lock at a time, and the pid text written
+     * through the holder stays readable by others. */
+    char lock[PATH_MAX], text[32] = "";
+    snprintf(lock, sizeof lock, "%s/test.lock", dir);
+    unlink(lock);
+    CHECK(nq_lock_probe(lock) == 0);
+    int h = nq_lock_acquire(lock);
+    CHECK(h >= 0);
+    CHECK(nq_lock_write(h, "4242\n") >= 0);
+    CHECK(nq_lock_probe(lock) == 1);
+    CHECK(nq_lock_acquire(lock) < 0);
+    FILE *f = fopen(lock, "rb");
+    CHECK(f && fgets(text, sizeof text, f) && !strcmp(text, "4242\n"));
+    if (f) fclose(f);
+    nq_lock_release(h);
+    CHECK(nq_lock_probe(lock) == 0);
+    unlink(lock);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -354,6 +409,7 @@ int main(int argc, char **argv)
     test_replay(dir);
     test_format();
     test_paths(dir);
+    test_compat(dir);
     if (g_failed) {
         fprintf(stderr, "%d check(s) failed\n", g_failed);
         return 1;

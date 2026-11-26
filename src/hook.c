@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "adapters.h"
 #include "bus.h"
@@ -242,6 +244,9 @@ int cmd_hook(nq_ctx *c, int argc, char **argv)
 
     cJSON *in = NULL;
     if (!isatty(STDIN_FILENO)) {
+#ifdef _WIN32
+        _setmode(STDIN_FILENO, _O_BINARY);
+#endif
         char *text = read_fd_all(STDIN_FILENO, 4 * 1024 * 1024, NULL);
         if (text) in = cJSON_Parse(text);
         free(text);

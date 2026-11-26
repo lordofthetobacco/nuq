@@ -11,8 +11,14 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 mkdir -p "$T/bin"
-cp "$FAKE_TUI" "$T/bin/claude"
-PATH="$T/bin:$PATH"
+cp "$FAKE_TUI" "$T/bin/claude$EXE"
+if [ -n "$NQ_WIN" ]; then
+    # MSYS splits PATH on ':' when it hands it to native programs, so the
+    # entry must be in /c/x form for C:/x/bin to reach nuq.exe.
+    PATH="$(cygpath -u "$T")/bin:$PATH"
+else
+    PATH="$T/bin:$PATH"
+fi
 export PATH
 
 # hook EVENT [JSON]   what Claude would run inside the pane of claude-1
@@ -35,7 +41,7 @@ for ev in SessionStart UserPromptSubmit PostToolUse Stop Notification; do
 done
 grep -q 'hook claude Stop' "$settings" || fail "Stop hook does not call nuq"
 grep -q 'Bash(nuq send:\*)' "$settings" || fail "nuq send is not pre-approved"
-ps -ax -o args= | grep -q "^$T/bin/claude --settings $settings" || fail "claude was not started with --settings"
+proc_args | grep -q "^$T/bin/claude --settings $settings" || fail "claude was not started with --settings"
 [ "$(state_of claude-1)" = starting ] || fail "expected state starting, got $(state_of claude-1)"
 
 step "SessionStart explains the grid and marks the agent idle"
@@ -123,14 +129,34 @@ has "$out" "* claude-1 (claude)" "the dashboard (main agent mark)"
 has "$out" "dana -> @claude-1" "the dashboard's message flow"
 
 step "the dashboard runs full-screen and quits on q"
-tmux -L "$NUQ_TMUX_SOCKET" new-window -d -n dash -- env LANG=en_US.UTF-8 "$NQ" dash
-waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t dash | grep -q "Message flow"' "the dashboard to draw"
-screen=$(tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t dash)
+if [ -n "$NQ_WIN" ]; then
+    # A native pane has no env program; its console is UTF-8 without LANG.
+    set -- "$NQ" dash
+else
+    set -- env LANG=en_US.UTF-8 "$NQ" dash
+fi
+tmux -L "$NUQ_TMUX_SOCKET" new-window -d -n dash -- "$@"
+# psmux reads a bare target as a session name; ":dash" is the window.
+dash=dash
+[ -z "$NQ_WIN" ] || dash=:dash
+waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$dash" | grep -q "Message flow"' "the dashboard to draw"
+screen=$(tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$dash")
 has "$screen" "claude-1" "the dashboard screen"
 has "$screen" "Changed files" "the dashboard screen"
 has "$screen" "src/x.c  [claude-1]" "the dashboard file attribution"
-tmux -L "$NUQ_TMUX_SOCKET" send-keys -t dash q
+tmux -L "$NUQ_TMUX_SOCKET" send-keys -t "$dash" q
 waitfor '! tmux -L "$NUQ_TMUX_SOCKET" list-windows -F "#{window_name}" | grep -qx dash' "the dashboard to quit"
+
+if [ -n "$NQ_WIN" ]; then
+    step "Windows paths from hooks are made relative whatever their spelling"
+    # Claude Code on Windows reports C:\x\y paths (escaped in JSON), with
+    # the drive letter in whatever case the directory was opened with.
+    winproj=$(printf '%s' "$PROJ" | sed 's|^C:|c:|; s|/|\\\\|g')
+    hook PostToolUse "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$winproj\\\\src\\\\y.c\",\"content\":\"1\\n\"}}" >/dev/null
+    out=$("$NQ" dash --once)
+    has "$out" "src/y.c  (claude-1)" "the dashboard"
+    hasnt "$out" 'src\y.c' "the dashboard"
+fi
 
 step "a permission prompt blocks waking"
 hook Notification '{"notification_type":"permission_prompt"}'
@@ -174,12 +200,12 @@ step "if the agent dies holding a task, the task returns to the queue"
 has "$("$NQ" work)" "queued"
 
 step "codex gets trusted hooks for this run and mail by paste"
-cp "$FAKE_TUI" "$T/bin/codex"
+cp "$FAKE_TUI" "$T/bin/codex$EXE"
 : >"$FAKE_AGENT_LOG"
 "$NQ" codex </dev/null >/dev/null || fail "launching codex"
 waitfor '"$NQ" ls | grep "^codex-1" | grep -q "%"' "codex-1 to register"
 waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$("$NQ" ls | awk "\$1 == \"codex-1\" { print \$6 }")" | grep -q "fake tui ready"' "the fake codex to start"
-args=$(ps -ax -o args= | grep "^$T/bin/codex ")
+args=$(proc_args | grep "^$T/bin/codex ")
 has "$args" "features.hooks=true" "codex arguments"
 has "$args" "hook codex Stop" "codex arguments"
 has "$args" 'config.toml:stop:0:0" = { trusted_hash = "sha256:' "codex arguments"

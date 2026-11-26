@@ -293,9 +293,20 @@ static void commit(nq_store *s, cJSON *r)
     cJSON_Delete(r);
 }
 
+#ifdef _WIN32
+/* Binary: the journal is byte-exact JSON lines and is read back with a
+ * seek from the end. N: the handle is not inherited by processes the broker
+ * starts. */
+#define JOURNAL_READ "rbN"
+#define JOURNAL_APPEND "a+bN"
+#else
+#define JOURNAL_READ "r"
+#define JOURNAL_APPEND "a+"
+#endif
+
 int st_replay(nq_store *s, const char *path)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, JOURNAL_READ);
     if (!f) return errno == ENOENT ? 0 : -1;
     char *line = NULL;
     size_t cap = 0;
@@ -315,7 +326,7 @@ int st_replay(nq_store *s, const char *path)
 
 int st_open_journal(nq_store *s, const char *path)
 {
-    FILE *f = fopen(path, "a+");
+    FILE *f = fopen(path, JOURNAL_APPEND);
     if (!f) return -1;
     /* Start on a fresh line in case the last write was interrupted. */
     if (fseek(f, -1, SEEK_END) == 0) {

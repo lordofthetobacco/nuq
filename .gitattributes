@@ -1,0 +1,3 @@
+# LF everywhere: the shell tests run under Git Bash on Windows, and the skill
+# file is embedded in the binary byte for byte.
+* text=auto eol=lf

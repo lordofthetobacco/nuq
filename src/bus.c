@@ -2,6 +2,14 @@
 
 #include <string.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#include <sddl.h>
+#else
+#include <poll.h>
+#endif
+
 #ifdef NQ_NN_INSTALLED_HEADERS
 #include <nanomsg/nn.h>
 #include <nanomsg/pubsub.h>
@@ -11,8 +19,50 @@
 #include "pubsub.h"
 #include "reqrep.h"
 #endif
+#ifdef _WIN32
+#ifdef NQ_NN_INSTALLED_HEADERS
+#include <nanomsg/ipc.h>
+#else
+#include "ipc.h"
+#endif
+#endif
 
 #include "util.h"
+
+#ifdef _WIN32
+/* nanomsg's ipc:// is a named pipe, which by default every local account
+ * may open for reading. Only this user (and SYSTEM) may use ours, the way the
+ * private runtime directory guards the Unix sockets. nanomsg keeps the
+ * pointer, so the attributes live as long as the process. */
+static SECURITY_ATTRIBUTES *pipe_security(void)
+{
+    static SECURITY_ATTRIBUTES sa;
+    static int done;
+    if (done) return sa.lpSecurityDescriptor ? &sa : NULL;
+    done = 1;
+    HANDLE tok;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return NULL;
+    union {
+        TOKEN_USER user;
+        char buf[256];
+    } info;
+    DWORD n = 0;
+    char *sid = NULL;
+    BOOL ok = GetTokenInformation(tok, TokenUser, &info, sizeof info, &n) &&
+              ConvertSidToStringSidA(info.user.User.Sid, &sid);
+    CloseHandle(tok);
+    if (!ok) return NULL;
+    char sddl[256];
+    snprintf(sddl, sizeof sddl, "D:P(A;;GA;;;%s)(A;;GA;;;SY)", sid);
+    LocalFree(sid);
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, NULL)) return NULL;
+    sa.nLength = sizeof sa;
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    return &sa;
+}
+#endif
 
 static int bind_socket(int proto, const char *url)
 {
@@ -21,6 +71,13 @@ static int bind_socket(int proto, const char *url)
     /* A vanished peer must never be able to stall the broker. */
     int to = 1000;
     nn_setsockopt(s, NN_SOL_SOCKET, NN_SNDTIMEO, &to, sizeof to);
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES *sa = pipe_security();
+    if (!sa || nn_setsockopt(s, NN_IPC, NN_IPC_SEC_ATTR, sa, sizeof *sa) < 0) {
+        nn_close(s);
+        return -1;
+    }
+#endif
     if (nn_bind(s, url) < 0) {
         nn_close(s);
         return -1;
@@ -44,6 +101,25 @@ int bus_rcvfd(int sock)
     size_t len = sizeof fd;
     if (nn_getsockopt(sock, NN_SOL_SOCKET, NN_RCVFD, &fd, &len) < 0) return -1;
     return fd;
+}
+
+int bus_wait(int sock, int timeout_ms)
+{
+#ifdef _WIN32
+    SOCKET fd;
+    size_t len = sizeof fd;
+    if (nn_getsockopt(sock, NN_SOL_SOCKET, NN_RCVFD, &fd, &len) < 0) return -1;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    int n = select(0, &rd, NULL, NULL, timeout_ms < 0 ? NULL : &tv);
+#else
+    struct pollfd pfd = {bus_rcvfd(sock), POLLIN, 0};
+    if (pfd.fd < 0) return -1;
+    int n = poll(&pfd, 1, timeout_ms);
+#endif
+    return n < 0 ? -1 : n > 0;
 }
 
 int bus_set_rcvtimeo(int sock, int timeout_ms)

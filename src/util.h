@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "compat.h"
 #include "cJSON.h"
 
 #ifndef NQ_VERSION
@@ -22,7 +23,7 @@ typedef struct {
 
 void sb_add(sb_t *sb, const char *s, size_t n);
 void sb_adds(sb_t *sb, const char *s);
-void sb_addf(sb_t *sb, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void sb_addf(sb_t *sb, const char *fmt, ...) NQ_PRINTF(2, 3);
 void sb_free(sb_t *sb);
 
 /* NULL-terminated argv builder. Strings are borrowed, not copied. */
@@ -39,10 +40,10 @@ void *xcalloc(size_t n, size_t size);
 void *xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 
-void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
-void nq_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+NQ_NORETURN void die(const char *fmt, ...) NQ_PRINTF(1, 2);
+void nq_warn(const char *fmt, ...) NQ_PRINTF(1, 2);
 /* Timestamped line on stderr; the detached broker's stderr is its log file. */
-void nq_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void nq_log(const char *fmt, ...) NQ_PRINTF(1, 2);
 
 uint64_t now_ms(void);
 void sleep_ms(int ms);

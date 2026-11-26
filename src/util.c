@@ -8,9 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -141,6 +143,7 @@ void nq_log(const char *fmt, ...)
     fflush(stderr);
 }
 
+#ifndef _WIN32 /* compat_win.c */
 uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -153,6 +156,7 @@ void sleep_ms(int ms)
     struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
 }
+#endif
 
 uint64_t fnv1a64(const char *s)
 {
@@ -194,6 +198,7 @@ int valid_name(const char *s)
     return n <= 32;
 }
 
+#ifndef _WIN32 /* compat_win.c */
 int mkdir_p(const char *path, mode_t mode)
 {
     char buf[PATH_MAX];
@@ -212,6 +217,7 @@ int mkdir_p(const char *path, mode_t mode)
     if (mkdir(buf, mode) < 0 && errno != EEXIST) return -1;
     return 0;
 }
+#endif
 
 char *read_fd_all(int fd, size_t max, size_t *len)
 {
@@ -237,6 +243,7 @@ char *read_fd_all(int fd, size_t max, size_t *len)
     return sb.p;
 }
 
+#ifndef _WIN32 /* compat_win.c */
 int self_exe(char *buf, size_t len)
 {
     char tmp[PATH_MAX];
@@ -370,6 +377,7 @@ int run_cmd(const char *const argv[], const char *in, size_t in_len, sb_t *out, 
     }
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
+#endif
 
 const char *jstr(const cJSON *o, const char *key)
 {
