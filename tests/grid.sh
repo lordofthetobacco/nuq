@@ -130,8 +130,12 @@ waitfor 'screen | grep "Agent terminal" | grep -q "Agents"' "the wide layout to 
 step "the agent tile is display only: typing never reaches the agent"
 waitfor 'screen | grep -q "fake tui ready"' "the selected agent's live output"
 term send-keys -t ui -l -- 'xyzzy'
-printf 'pasted line' | term load-buffer -
-term paste-buffer -p -d -t ui
+if [ -z "$NQ_WIN" ]; then
+    # Dropping a paste needs bracketed paste. PDCurses (Windows) has none:
+    # a paste arrives there as key presses, shortcuts included.
+    printf 'pasted line' | term load-buffer -
+    term paste-buffer -p -d -t ui
+fi
 sleep 1
 hasnt "$(screen)" "xyzzy" "the agent tile (typed text)"
 hasnt "$(screen)" "pasted line" "the agent tile (pasted text)"
