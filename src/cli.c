@@ -87,7 +87,7 @@ int cmd_up(nq_ctx *c, int argc, char **argv)
     return 0;
 }
 
-int cmd_down(nq_ctx *c, int argc, char **argv)
+int cmd_nuke(nq_ctx *c, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
@@ -95,7 +95,7 @@ int cmd_down(nq_ctx *c, int argc, char **argv)
         printf("no grid is running for %s\n", c->p.dir);
         return 0;
     }
-    cJSON_Delete(cli_call(c, cli_req("down")));
+    cJSON_Delete(cli_call(c, cli_req("nuke")));
     for (int i = 0; i < 60 && daemon_alive(&c->p); i++) sleep_ms(50);
     printf("grid stopped for %s\n", c->p.dir);
     return 0;

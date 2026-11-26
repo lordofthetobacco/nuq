@@ -30,8 +30,10 @@ int tmux_set_label(const char *pane, const char *label);
 /* Arranges the session's panes. The window holding main_pane gets the
  * "main-vertical" layout: main_pane on the left, full height, half the
  * width, the other panes stacked on the right. Any other (overflow) window
- * is tiled. main_pane == NULL keeps the first window's first pane as main. */
-void tmux_layout(const char *session, const char *main_pane);
+ * is tiled. main_pane == NULL keeps the first window's first pane as main.
+ * Returns -1 and changes nothing while a window is zoomed (an agent taken
+ * over): a layout would undo the zoom, so the caller retries later. */
+int tmux_layout(const char *session, const char *main_pane);
 /* Most panes the main window takes before new agents go to another window:
  * the right column needs a few rows per agent to be usable. */
 int tmux_main_window_full(const char *window);

@@ -34,7 +34,7 @@ static const char USAGE[] =
     "The grid:\n"
     "  nuq ls         agents and their state     nuq tail      live message log\n"
     "  nuq work       open tasks (--all: every)  nuq attach    raw tmux (F12 leaves)\n"
-    "  nuq kill NAME  stop one agent             nuq down      stop the whole grid\n"
+    "  nuq kill NAME  stop one agent             nuq nuke      stop the whole grid\n"
     "  nuq up         start only the broker      nuq doctor    check the installation\n"
     "  nuq completion bash|zsh                   nuq version\n"
     "  nuq skills install   give your agents the nuq skill (nuq skills: where it is installed)\n"
@@ -50,7 +50,7 @@ static const struct {
     const char *name;
     cmd_fn fn;
 } COMMANDS[] = {
-    {"up", cmd_up},         {"down", cmd_down},     {"send", cmd_send},   {"pub", cmd_pub},
+    {"up", cmd_up},         {"nuke", cmd_nuke},     {"send", cmd_send},   {"pub", cmd_pub},
     {"sub", cmd_sub},       {"unsub", cmd_unsub},   {"push", cmd_push},   {"take", cmd_take},
     {"done", cmd_done},     {"fail", cmd_fail},     {"inbox", cmd_inbox}, {"show", cmd_show},
     {"listen", cmd_listen}, {"ls", cmd_ls},         {"tail", cmd_tail},   {"work", cmd_work},

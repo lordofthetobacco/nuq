@@ -5,11 +5,11 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-option(NUQ_SYSTEM_NANOMSG "Link an installed nanomsg instead of building the pinned copy" OFF)
+option(NUQ_SYSTEM_NNG "Link an installed NNG 2.x instead of building the pinned copy" OFF)
 option(NUQ_SANITIZE "Build nuq with AddressSanitizer and UBSan" OFF)
 option(NUQ_TESTS "Build the test suite" ON)
 
-include(cmake/Nanomsg.cmake)
+include(cmake/Nng.cmake)
 
 set(CURSES_NEED_NCURSES TRUE)
 # macOS ncurses already renders multibyte text. Linux ships a separate
@@ -57,7 +57,7 @@ target_compile_definitions(nuq_core PUBLIC
   _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE _DARWIN_C_SOURCE
   NQ_VERSION="${PROJECT_VERSION}")
 target_compile_options(nuq_core PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
-target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} PRIVATE nuq_nanomsg)
+target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} PRIVATE nuq_nng)
 target_include_directories(nuq_core SYSTEM PRIVATE ${CURSES_INCLUDE_DIRS})
 
 add_executable(nuq src/main.c)

@@ -21,12 +21,12 @@ export XDG_STATE_HOME="$T/state"
 export XDG_CONFIG_HOME="$T/config"
 export NUQ_TMUX_SOCKET="nqt$$"
 export FAKE_AGENT_LOG="$T/agent.log"
-unset NUQ_DIR NUQ_AGENT TMUX TMUX_PANE
+unset NUQ_DIR NUQ_AGENT NUQ_TOKEN TMUX TMUX_PANE
 
 cd "$PROJ" || exit 1
 
 cleanup() {
-    "$NQ" down >/dev/null 2>&1
+    "$NQ" nuke >/dev/null 2>&1
     tmux -L "$NUQ_TMUX_SOCKET" kill-server >/dev/null 2>&1
     # tmux can leave the socket file of a killed server behind.
     rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$NUQ_TMUX_SOCKET"

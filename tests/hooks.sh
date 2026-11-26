@@ -122,14 +122,14 @@ hasnt "$out" "$PROJ/src" "the dashboard (paths should be relative)"
 has "$out" "* claude-1 (claude)" "the dashboard (main agent mark)"
 has "$out" "dana -> @claude-1" "the dashboard's message flow"
 
-step "the dashboard runs full-screen and quits on q"
+step "the dashboard runs full-screen and quits on Ctrl-q"
 tmux -L "$NUQ_TMUX_SOCKET" new-window -d -n dash -- env LANG=en_US.UTF-8 "$NQ" dash
-waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t dash | grep -q "Message flow"' "the dashboard to draw"
+waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t dash | grep -q "Agent terminal"' "the dashboard to draw"
 screen=$(tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t dash)
 has "$screen" "claude-1" "the dashboard screen"
 has "$screen" "Changed files" "the dashboard screen"
 has "$screen" "src/x.c  [claude-1]" "the dashboard file attribution"
-tmux -L "$NUQ_TMUX_SOCKET" send-keys -t dash q
+tmux -L "$NUQ_TMUX_SOCKET" send-keys -t dash C-q
 waitfor '! tmux -L "$NUQ_TMUX_SOCKET" list-windows -F "#{window_name}" | grep -qx dash' "the dashboard to quit"
 
 step "a permission prompt blocks waking"

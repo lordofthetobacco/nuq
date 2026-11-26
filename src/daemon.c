@@ -34,7 +34,7 @@ typedef struct {
     nq_store st;
     int rep, pub;
     int stop;
-    int kill_session;    /* `nuq down`: take the tmux session with us */
+    int kill_session;    /* `nuq nuke`: take the tmux session with us */
     int session_ended;
     int had_panes;       /* a pane agent has registered during this run */
     size_t pane_count;   /* panes seen at the last check, to know when to re-tile */
@@ -540,10 +540,17 @@ static cJSON *handle(daemon_t *d, const cJSON *q)
         if (a->pane) tmux(NULL, NULL, "kill-pane", "-t", a->pane, NULL);
         st_unregister(&d->st, name);
         event(d, "leave", name, 0, NULL);
+        /* Killing the last pane ends the tmux session. That was asked for,
+         * not a sign the grid is over: forget the panes so check_panes()
+         * does not stop the broker and drop the queue with it. */
+        int panes_left = 0;
+        for (size_t i = 0; i < d->st.n_agents; i++)
+            if (d->st.agents[i]->live && d->st.agents[i]->pane) panes_left = 1;
+        if (!panes_left) d->had_panes = 0;
         return reply_ok();
     }
 
-    if (!strcmp(op, "down")) {
+    if (!strcmp(op, "nuke")) {
         d->stop = 1;
         d->kill_session = 1;
         return reply_ok();
@@ -702,7 +709,8 @@ static void check_panes(daemon_t *d, uint64_t now)
     const nq_agent *m = st_main_agent(&d->st);
     const char *mp = m ? m->pane : "";
     if (count != d->pane_count || strcmp(mp, d->main_pane)) {
-        tmux_layout(d->p->session, m ? m->pane : NULL);
+        /* While an agent is taken over (zoomed) the layout waits. */
+        if (tmux_layout(d->p->session, m ? m->pane : NULL) < 0) return;
         d->pane_count = count;
         snprintf(d->main_pane, sizeof d->main_pane, "%s", mp);
     }
@@ -816,13 +824,13 @@ int cmd_daemon(const nq_paths *p)
     if (st_open_journal(&d.st, p->journal) < 0) die("cannot open %s: %s", p->journal, strerror(errno));
     fcntl(fileno(d.st.journal), F_SETFD, FD_CLOEXEC);
 
-    /* All nanomsg use starts here, after any forking is over. */
+    /* All NNG use starts here, after any forking is over. */
     d.rep = bus_rep_bind(p->rpc_url);
     if (d.rep < 0) die("bind %s: %s", p->rpc_url, bus_error());
     d.pub = bus_pub_bind(p->ev_url);
     if (d.pub < 0) die("bind %s: %s", p->ev_url, bus_error());
     int rcvfd = bus_rcvfd(d.rep);
-    if (rcvfd < 0) die("nanomsg gave no receive descriptor: %s", bus_error());
+    if (rcvfd < 0) die("NNG gave no receive descriptor: %s", bus_error());
 
     nq_log("broker %s up for %s (pid %d, %d journal records, %zu messages)", NQ_VERSION, p->dir,
            (int)getpid(), replayed, d.st.n_msgs);
@@ -868,6 +876,9 @@ int cmd_daemon(const nq_paths *p)
         char target[128];
         snprintf(target, sizeof target, "=%s", p->session);
         tmux(NULL, NULL, "kill-session", "-t", target, NULL);
+        /* The dashboard's shell tab lives in its own session next to it. */
+        snprintf(target, sizeof target, "=%s-sh", p->session);
+        tmux(NULL, NULL, "kill-session", "-t", target, NULL);
     }
     if (d.kill_session || d.session_ended) {
         for (size_t i = 0; i < d.st.n_agents; i++) {
@@ -877,7 +888,7 @@ int cmd_daemon(const nq_paths *p)
     }
     nq_log("broker stopping%s", g_signal ? " (signal)" : "");
 
-    /* nanomsg has no linger: give the last reply a moment to leave. */
+    /* NNG has no linger: give the last reply a moment to leave. */
     sleep_ms(150);
     bus_close(d.rep);
     bus_close(d.pub);

@@ -27,7 +27,7 @@ cJSON *cli_req(const char *op);
 
 /* Each takes the arguments after the command word. */
 int cmd_up(nq_ctx *c, int argc, char **argv);
-int cmd_down(nq_ctx *c, int argc, char **argv);
+int cmd_nuke(nq_ctx *c, int argc, char **argv);
 int cmd_send(nq_ctx *c, int argc, char **argv);
 int cmd_pub(nq_ctx *c, int argc, char **argv);
 int cmd_sub(nq_ctx *c, int argc, char **argv);
