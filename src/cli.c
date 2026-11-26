@@ -26,7 +26,11 @@ cJSON *cli_rpc(const nq_ctx *c, cJSON *req, int timeout_ms)
     char *text = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
     /* Checking the lock first makes "no broker" instant instead of a timeout. */
+    uint64_t dbg_t0 = now_ms();
     char *reply = daemon_alive(&c->p) ? bus_request(c->p.rpc_url, text, timeout_ms) : NULL;
+    if (getenv("NUQ_DBG"))
+        fprintf(stderr, "DBG %llu rpc %.40s -> %s after %llu ms (%s)\n", (unsigned long long)dbg_t0, text,
+                reply ? "reply" : "NULL", (unsigned long long)(now_ms() - dbg_t0), reply ? "" : bus_error());
     free(text);
     if (!reply) return NULL;
     cJSON *r = cJSON_Parse(reply);

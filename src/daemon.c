@@ -937,13 +937,18 @@ int cmd_daemon(const nq_paths *p)
         poll(&pfd, 1, in_flight(&d) ? 50 : 1000);
 #endif
 
+        uint64_t dbg_wake = now_ms();
         for (;;) {
             char *req = bus_recv(d.rep, BUS_DONTWAIT, NULL);
             if (!req) break;
+            uint64_t dbg_t0 = now_ms();
             cJSON *q = cJSON_Parse(req);
             cJSON *r = q ? handle(&d, q) : reply_err("request is not valid JSON");
             char *out = cJSON_PrintUnformatted(r);
-            bus_send(d.rep, out, strlen(out), 0);
+            int dbg_rc = bus_send(d.rep, out, strlen(out), 0);
+            nq_log("DBG %llu req op=%s name=%s took=%llu send=%d", (unsigned long long)dbg_t0,
+                   q && jstr(q, "op") ? jstr(q, "op") : "?", q && jstr(q, "name") ? jstr(q, "name") : "-",
+                   (unsigned long long)(now_ms() - dbg_t0), dbg_rc);
             free(out);
             cJSON_Delete(r);
             cJSON_Delete(q);
@@ -954,8 +959,16 @@ int cmd_daemon(const nq_paths *p)
         if (now - d.last_check >= 2000) {
             d.last_check = now;
             check_panes(&d, now);
+            if (now_ms() - now > 50)
+                nq_log("DBG %llu check_panes took=%llu", (unsigned long long)now, (unsigned long long)(now_ms() - now));
         }
+        uint64_t dbg_d = now_ms();
         deliver(&d, now);
+        if (now_ms() - dbg_d > 50)
+            nq_log("DBG %llu deliver took=%llu", (unsigned long long)dbg_d, (unsigned long long)(now_ms() - dbg_d));
+        if (now_ms() - dbg_wake > 200)
+            nq_log("DBG %llu loop iteration took=%llu", (unsigned long long)dbg_wake,
+                   (unsigned long long)(now_ms() - dbg_wake));
     }
 
     /* On a signal the panes are left alone: the agents keep running and the

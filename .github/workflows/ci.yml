@@ -1,56 +1,25 @@
 name: ci
 on:
   push:
-    # main is tested by release.yml, which calls this workflow before it
-    # publishes anything.
-    branches-ignore: [main]
-  pull_request:
-  workflow_call:
+    branches: [debug/hooks-flake]
 permissions:
   contents: read
 jobs:
-  build:
+  loop:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-24.04]
-    runs-on: ${{ matrix.os }}
+        n: [1, 2, 3, 4]
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install tools (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build tmux zsh libncurses-dev
-      - name: Install tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ninja tmux
-      - name: Configure
-        run: cmake --preset debug
-      - name: Build
-        run: cmake --build --preset debug
-      - name: Test
-        run: ctest --preset debug
-  windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-      - name: Developer environment (MSVC, CMake, Ninja)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64
-      # psmux provides tmux.exe. Pinned release archive, checked by hash.
-      - name: Install psmux
+      - run: brew install ninja tmux
+      - run: cmake --preset debug && cmake --build --preset debug
+      - name: Loop the hooks test
         run: |
-          $zip = "$env:RUNNER_TEMP\psmux.zip"
-          Invoke-WebRequest https://github.com/marlocarlo/psmux/releases/download/v3.4.0/psmux-v3.4.0-windows-x64.zip -OutFile $zip
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'A66B6BE7C13C6FA0DC3660A267B9E34EAA91A4EB7F07FBD55A0468018BD0F721') { throw 'psmux archive hash mismatch' }
-          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\psmux"
-          "$env:RUNNER_TEMP\psmux" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Configure
-        run: cmake --preset windows-debug
-      - name: Build
-        run: cmake --build --preset windows-debug
-      - name: Test
-        run: ctest --preset windows-debug
+          export NQ=$PWD/build/debug/nuq FAKE_TUI=$PWD/build/debug/tests/fake_tui FAKE_AGENT=$PWD/tests/fake_agent.sh ASAN_OPTIONS=detect_leaks=0
+          fails=0
+          for i in $(seq 1 12); do
+            if out=$(bash tests/hooks.sh 2>&1); then echo "run $i ok"; else fails=$((fails+1)); echo "=== run $i FAILED"; echo "$out" | cut -c1-300; fi
+          done
+          echo "fails=$fails"
