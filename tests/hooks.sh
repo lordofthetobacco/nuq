@@ -45,7 +45,6 @@ proc_args | grep -q "^$T/bin/claude --settings $settings" || fail "claude was no
 [ "$(state_of claude-1)" = starting ] || fail "expected state starting, got $(state_of claude-1)"
 
 step "SessionStart explains the grid and marks the agent idle"
-export NUQ_DBG=1
 as dana "$NQ" inbox >/dev/null || fail "dana could not reach the broker"
 out=$(hook SessionStart '{"source":"startup"}')
 case "$out" in *"dana (person)"*) ;; *) echo "DBG ls after failure:" >&2; "$NQ" ls >&2 ;; esac

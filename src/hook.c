@@ -18,6 +18,12 @@
  * one deliberate non-zero exit is the background waiter's "wake up" (2). */
 
 #define HOOK_TIMEOUT_MS 500
+/* SessionStart runs once per session and must not be lost: it is what marks
+ * the agent ready and tells it who else is here. The broker can be busy for
+ * most of a second while it arranges the panes of an agent that just joined
+ * (which is exactly when this hook runs), so it gets longer. */
+#define HOOK_START_TIMEOUT_MS 2000
+static int hook_timeout_ms = HOOK_TIMEOUT_MS;
 /* Agents cap injected context (Claude: 10k characters), so messages are
  * handed over in batches and long bodies are cut with a pointer to
  * `nuq show`. Whatever is left stays in the inbox for the next hook. */
@@ -55,7 +61,7 @@ static char *exchange_with(const nq_ctx *c, const char *state, int drain, int cl
         cJSON_AddNumberToObject(q, "max", HOOK_BATCH_BYTES);
     }
     if (claim) cJSON_AddBoolToObject(q, "claim", 1);
-    cJSON *r = cli_rpc(c, q, HOOK_TIMEOUT_MS);
+    cJSON *r = cli_rpc(c, q, hook_timeout_ms);
     if (!r) return NULL;
     sb_t out = {0};
     const cJSON *msgs = cJSON_GetObjectItemCaseSensitive(r, "msgs");
@@ -110,7 +116,7 @@ static void emit_context(const char *event, const char *text)
 
 static void emit_bootstrap(const nq_ctx *c, const char *event)
 {
-    cJSON *ls = cli_rpc(c, cli_req("ls"), HOOK_TIMEOUT_MS);
+    cJSON *ls = cli_rpc(c, cli_req("ls"), hook_timeout_ms);
     sb_t text = {0};
     adapter_bootstrap(&text, c->me, ls ? cJSON_GetObjectItemCaseSensitive(ls, "agents") : NULL);
     emit_context(event, text.p);
@@ -212,6 +218,7 @@ static int hook_event(const nq_ctx *c, const char *event, const cJSON *in)
     if (!strcmp(event, "SessionStart")) {
         /* After a compaction the agent is still mid-turn. */
         const char *source = jstr(in, "source");
+        hook_timeout_ms = HOOK_START_TIMEOUT_MS;
         free(exchange(c, source && !strcmp(source, "compact") ? NULL : "idle", 0, 0));
         emit_bootstrap(c, event);
     } else if (!strcmp(event, "UserPromptSubmit")) {
