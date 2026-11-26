@@ -8,6 +8,12 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(NUQ_SYSTEM_NNG "Link an installed NNG 2.x instead of building the pinned copy" OFF)
 option(NUQ_SANITIZE "Build nuq with AddressSanitizer and UBSan" OFF)
 option(NUQ_TESTS "Build the test suite" ON)
+# The release workflow passes the version it is about to tag. Anything else
+# reports the project version above.
+set(NUQ_VERSION "" CACHE STRING "Version nuq reports instead of the project version")
+if(NOT NUQ_VERSION)
+  set(NUQ_VERSION "${PROJECT_VERSION}")
+endif()
 
 # Windows: link the C runtime statically, so nuq.exe runs on machines without
 # the Visual C++ redistributable and inside panes whatever their PATH.
@@ -95,7 +101,7 @@ add_library(nuq_core STATIC
 target_include_directories(nuq_core PUBLIC src)
 target_compile_definitions(nuq_core PUBLIC
   ${NQ_PLATFORM_DEFS}
-  NQ_VERSION="${PROJECT_VERSION}")
+  NQ_VERSION="${NUQ_VERSION}")
 target_compile_options(nuq_core PRIVATE ${NQ_WARN_FLAGS})
 target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} nuq_manifest PRIVATE nuq_nng)
 if(CURSES_INCLUDE_DIRS)
