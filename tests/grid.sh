@@ -64,10 +64,15 @@ waitfor 'check_main one' "one to stay the left half after a resize (got: $(geome
 "$NQ" kill three >/dev/null
 waitfor '[ "$(panes)" = 2 ]' "three's pane to close"
 
-step "the pane runs in the grid directory with the launcher's environment"
 p1=$(pane_of one)
 case "$p1" in %[0-9]*) ;; *) fail "could not find one's pane id, got '$p1'" ;; esac
-waitfor 'tm capture-pane -p -J -t "$p1" | grep -q "fake agent one ready in $(here)"' "agent banner"
+step "the pane runs in the grid directory with the launcher's environment"
+if [ -n "$NQ_WIN" ]; then
+    # psmux can crop the original banner when a split narrows the pane.
+    waitfor 'grep -Fxq "fake agent one ready in $(here)" "$FAKE_START_LOG"' "agent working directory"
+else
+    waitfor 'tm capture-pane -p -J -t "$p1" | grep -Fq "fake agent one ready in $(here)"' "agent banner"
+fi
 
 step "default arguments come from the config file, before the ones given"
 mkdir -p "$XDG_CONFIG_HOME/nuq"

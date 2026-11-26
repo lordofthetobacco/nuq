@@ -7,6 +7,7 @@
  *                      showing a permission dialog
  *   FAKE_ARGS_LOG      if set, the command line is appended to it, because
  *                      the tests have no `ps` to read it from (see fake_tui.c)
+ *   FAKE_START_LOG     if set, records the startup banner before pane resizing
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,14 @@ int main(int argc, char **argv)
         /* The tests compare it with the forward-slash form nuq uses. */
         for (char *p = cwd; *p; p++)
             if (*p == '\\') *p = '/';
-        printf("fake agent %s ready in %s\n> ", who && *who ? who : "?", cwd);
+        if (!who || !*who) who = "?";
+        const char *start = getenv("FAKE_START_LOG");
+        FILE *f = start ? fopen(start, "ab") : NULL;
+        if (f) {
+            fprintf(f, "fake agent %s ready in %s\n", who, cwd);
+            fclose(f);
+        }
+        printf("fake agent %s ready in %s\n> ", who, cwd);
     }
     fflush(stdout);
 

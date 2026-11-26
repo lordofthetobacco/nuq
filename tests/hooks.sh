@@ -195,10 +195,6 @@ out=$(hook Stop '{}')
 has "$out" '"decision":"block"'
 has "$out" "second task"
 
-step "if the agent dies holding a task, the task returns to the queue"
-"$NQ" kill claude-1 >/dev/null
-has "$("$NQ" work)" "queued"
-
 step "codex gets trusted hooks for this run and mail by paste"
 cp "$FAKE_TUI" "$T/bin/codex$EXE"
 : >"$FAKE_AGENT_LOG"
@@ -211,6 +207,12 @@ has "$args" "hook codex Stop" "codex arguments"
 has "$args" 'config.toml:stop:0:0" = { trusted_hash = "sha256:' "codex arguments"
 has "$args" "sandbox_workspace_write.network_access=true" "codex arguments"
 hasnt "$args" "bypass-hook-trust" "codex arguments"
+
+step "if the agent dies holding a task, the task returns to the queue"
+# Codex keeps the grid alive but cannot claim work before SessionStart.
+"$NQ" kill claude-1 >/dev/null
+has "$("$NQ" work)" "queued"
+
 codex_hook() {
     printf '%s' "${2:-{\}}" | as codex-1 "$NQ" hook codex "$1"
 }

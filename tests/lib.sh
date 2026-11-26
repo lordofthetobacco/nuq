@@ -30,6 +30,7 @@ if [ -n "$NQ_WIN" ]; then
     export PSMUX_NO_WARM=1
     # There is no ps; the fake agents record their own command lines.
     export FAKE_ARGS_LOG="$T/args.log"
+    export FAKE_START_LOG="$T/start.log"
     EXE=.exe
 else
     EXE=
