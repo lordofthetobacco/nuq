@@ -45,7 +45,7 @@ proc_args | grep -q "^$T/bin/claude --settings $settings" || fail "claude was no
 [ "$(state_of claude-1)" = starting ] || fail "expected state starting, got $(state_of claude-1)"
 
 step "SessionStart explains the grid and marks the agent idle"
-as dana "$NQ" inbox >/dev/null
+as dana "$NQ" inbox >/dev/null || fail "dana could not reach the broker"
 out=$(hook SessionStart '{"source":"startup"}')
 has "$out" '"hookEventName":"SessionStart"'
 has "$out" "Your name in the grid is claude-1"

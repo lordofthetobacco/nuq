@@ -158,18 +158,24 @@ int tmux_layout(const char *session, const char *main_pane)
     char t[128], main_win[32] = "";
     exact(t, sizeof t, session);
     sb_t wins = {0};
-    if (tmux(&wins, NULL, "list-windows", "-t", t, "-F", "#{window_zoomed_flag}", NULL) == 0 && wins.p &&
-        strchr(wins.p, '1')) {
-        sb_free(&wins);
-        return -1;
-    }
-    sb_free(&wins);
-    if (tmux(&wins, NULL, "list-windows", "-t", t, "-F", "#{window_id}", NULL) != 0 || !wins.p) {
+    /* One line per window: "<zoomed> <id>". Every tmux call here keeps the
+     * broker from answering, so the two questions share one. */
+    if (tmux(&wins, NULL, "list-windows", "-t", t, "-F", "#{window_zoomed_flag} #{window_id}", NULL) != 0 ||
+        !wins.p) {
         sb_free(&wins);
         return 0;
     }
+    for (const char *l = wins.p; *l; l += strcspn(l, "\n"), l += *l == '\n') {
+        if (*l == '1') {
+            sb_free(&wins);
+            return -1;
+        }
+    }
     if (main_pane) query(main_win, sizeof main_win, main_pane, "#{window_id}");
-    if (!main_win[0]) snprintf(main_win, sizeof main_win, "%.*s", (int)strcspn(wins.p, "\n"), wins.p);
+    if (!main_win[0]) {
+        const char *id = strchr(wins.p, ' ');
+        if (id) snprintf(main_win, sizeof main_win, "%.*s", (int)strcspn(id + 1, "\r\n"), id + 1);
+    }
 
     if (main_pane) {
         /* main-vertical puts the window's first pane on the left. */
@@ -184,7 +190,10 @@ int tmux_layout(const char *session, const char *main_pane)
     }
 
     char *save = NULL;
-    for (char *w = strtok_r(wins.p, "\n", &save); w; w = strtok_r(NULL, "\n", &save)) {
+    for (char *l = strtok_r(wins.p, "\r\n", &save); l; l = strtok_r(NULL, "\r\n", &save)) {
+        const char *w = strchr(l, ' ');
+        if (!w) continue;
+        w++;
         if (!strcmp(w, main_win))
             main_vertical(w);
         else
