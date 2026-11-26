@@ -11,7 +11,7 @@
 
 /* Runs `tmux <args...>`; the argument list ends with NULL. Returns the exit
  * status. `out` (optional) receives stdout and stderr. */
-int tmux(sb_t *out, const char *in, ...) __attribute__((sentinel));
+int tmux(sb_t *out, const char *in, ...) NQ_SENTINEL;
 int tmux_argv(av_t *args, const char *in, sb_t *out);
 
 /* Installed and at least 3.2 (needed for per-pane options)? */
@@ -41,7 +41,8 @@ int tmux_main_window_full(const char *window);
 /* Makes F12 and Ctrl-q detach a client from the grid session, so whoever
  * took over an agent gets back to the nuq UI (or their shell). Uses a key
  * table only this session selects; other sessions and the global key
- * bindings are untouched. Safe to call repeatedly. */
+ * bindings are untouched. Safe to call repeatedly. (psmux can only keep
+ * that promise around an attach: see tmux_takeover in tmux.c.) */
 void tmux_grid_keys(const char *session);
 
 /* Is this process running in a pane of `session` (on the grid's server)? */

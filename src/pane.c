@@ -3,8 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 
 #include "adapters.h"
@@ -16,12 +21,41 @@
  * tells the broker which pane the agent lives in, runs the agent, and
  * reports when it exits. */
 
+#ifdef _WIN32
+/* Ctrl-C and Ctrl-Break typed in the pane reach every process on its
+ * console; they are meant for the agent. A handler routine, unlike
+ * SetConsoleCtrlHandler(NULL, TRUE), is not inherited by the agent. Closing
+ * the pane still ends the wrapper, and with it the job below. */
+static BOOL WINAPI ignore_break(DWORD ev)
+{
+    return ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT;
+}
+
+/* Puts this process, and so everything it starts from now on, into a job
+ * that is killed when the last handle to it closes. Only this process holds
+ * that handle, so when the pane is killed the agent and its children go
+ * too. Breakaway stays allowed for the detached broker. */
+static void join_kill_job(void)
+{
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (!job) return;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    memset(&li, 0, sizeof li);
+    li.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) ||
+        !AssignProcessToJobObject(job, GetCurrentProcess()))
+        CloseHandle(job);
+    /* On success the handle stays open until this process exits. */
+}
+#else
 static volatile sig_atomic_t g_child;
 
 static void forward(int sig)
 {
     if (g_child > 0) kill((pid_t)g_child, sig);
 }
+#endif
 
 /* Variables that describe the pane itself and must not be overwritten by
  * the launcher's copies. */
@@ -31,14 +65,22 @@ static int pane_owned(const char *entry)
                                         "TERM_PROGRAM_VERSION=", "SHLVL=", "PWD=", "OLDPWD=",
                                         "_=",     "COLUMNS=",   "LINES=", "NUQ_AGENT=",
                                         "NUQ_DIR=", "NUQ_TOKEN=", NULL};
+#ifdef _WIN32
+    /* psmux describes the pane in PSMUX_SESSION, PSMUX_TARGET_SESSION and
+     * friends. Variable names are case-insensitive on Windows. */
+    if (!_strnicmp(entry, "PSMUX_", 6)) return 1;
+    for (int i = 0; names[i]; i++)
+        if (!_strnicmp(entry, names[i], strlen(names[i]))) return 1;
+#else
     for (int i = 0; names[i]; i++)
         if (!strncmp(entry, names[i], strlen(names[i]))) return 1;
+#endif
     return 0;
 }
 
 static void load_env(const char *path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | NQ_O_BINARY);
     if (fd < 0) return;
     size_t len = 0;
     char *data = read_fd_all(fd, 8 * 1024 * 1024, &len);
@@ -52,7 +94,7 @@ static void load_env(const char *path)
         char *eq = strchr(entry, '=');
         if (!eq || eq == entry || pane_owned(entry)) continue;
         *eq = '\0';
-        setenv(entry, eq + 1, 1);
+        nq_setenv(entry, eq + 1);
     }
     free(data);
 }
@@ -61,16 +103,26 @@ static void load_env(const char *path)
 static void put_self_on_path(const char *self)
 {
     char found[PATH_MAX];
+#ifdef _WIN32
+    if (find_on_path("nuq", found, sizeof found) == 0 && !_stricmp(found, self)) return;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", self);
+    char *slash = (char *)nq_basename(dir);
+    if (slash == dir) return;
+    slash--;
+#else
     if (find_on_path("nuq", found, sizeof found) == 0 && !strcmp(found, self)) return;
     char dir[PATH_MAX];
     snprintf(dir, sizeof dir, "%s", self);
     char *slash = strrchr(dir, '/');
     if (!slash) return;
+#endif
     *slash = '\0';
     const char *path = getenv("PATH");
     sb_t np = {0};
-    sb_addf(&np, "%s%s%s", dir, path && *path ? ":" : "", path ? path : "");
-    setenv("PATH", np.p, 1);
+    char sep[2] = {NQ_PATH_LIST_SEP, '\0'};
+    sb_addf(&np, "%s%s%s", dir, path && *path ? sep : "", path ? path : "");
+    nq_setenv("PATH", np.p);
     sb_free(&np);
 }
 
@@ -84,11 +136,11 @@ int cmd_pane(nq_ctx *c, int argc, char **argv)
     char self[PATH_MAX];
     if (self_exe(self, sizeof self) < 0) die("cannot locate the nuq executable");
     load_env(envfile);
-    setenv("NUQ_DIR", c->p.dir, 1);
-    setenv("NUQ_AGENT", name, 1);
+    nq_setenv("NUQ_DIR", c->p.dir);
+    nq_setenv("NUQ_AGENT", name);
     char token[48];
     snprintf(token, sizeof token, "%lx.%llx", (long)getpid(), (unsigned long long)now_ms());
-    setenv("NUQ_TOKEN", token, 1);
+    nq_setenv("NUQ_TOKEN", token);
     put_self_on_path(self);
     c->me = name;
 
@@ -119,6 +171,19 @@ int cmd_pane(nq_ctx *c, int argc, char **argv)
     cJSON_Delete(r);
 
     uint64_t started = now_ms();
+#ifdef _WIN32
+    join_kill_job();
+    /* Whoever started the pane may have disabled Ctrl-C for its process
+     * group; that setting is inherited, so turn it back on for the agent. */
+    SetConsoleCtrlHandler(NULL, FALSE);
+    SetConsoleCtrlHandler(ignore_break, TRUE);
+    /* nq_spawn_wait runs .cmd agents (npm installs) through cmd.exe. */
+    int code = nq_spawn_wait(av.v);
+    if (code == -1) {
+        fprintf(stderr, "nuq: cannot run %s\n", agent_path);
+        code = 127;
+    }
+#else
     pid_t pid = fork();
     if (pid < 0) die("fork: %s", strerror(errno));
     if (pid == 0) {
@@ -153,6 +218,7 @@ int cmd_pane(nq_ctx *c, int argc, char **argv)
         }
         break;
     }
+#endif
 
     q = cli_req("bye");
     cJSON_AddStringToObject(q, "name", name);
@@ -162,7 +228,9 @@ int cmd_pane(nq_ctx *c, int argc, char **argv)
     av_free(&owned);
     av_free(&av);
 
+#ifndef _WIN32
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+#endif
     /* An agent that dies at once (bad flag, not logged in) would take its
      * error message with it when the pane closes. Hold the pane open. */
     if (code != 0 && now_ms() - started < 5000 && isatty(STDIN_FILENO)) {

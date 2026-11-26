@@ -9,14 +9,18 @@
 #include <curses.h>
 #include <limits.h>
 #include <locale.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <wchar.h>
+#ifdef _WIN32
+#include <signal.h>
+#else
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 #include "bus.h"
 #include "cli.h"
@@ -35,6 +39,14 @@ enum { C_IDLE = 1, C_BUSY, C_BLOCKED, C_ACCENT, C_TOPIC, C_SEP, C_DYN };
 
 /* Separator colour: xterm-256 19 (#0000af), plain blue on 8/16-colour terminals. */
 #define SEP_COLOR_256 19
+
+/* Attributes as passed to attrset(). PDCursesMod keeps the colour pair in
+ * the upper half of a 64-bit chtype, which an int would cut off. */
+#ifdef _WIN32
+typedef chtype dattr;
+#else
+typedef int dattr;
+#endif
 
 typedef struct {
     char name[48];
@@ -456,21 +468,101 @@ static int print_once(dash_t *d)
 
 /* ---- curses view -------------------------------------------------------- */
 
+#ifdef _WIN32
+/* wchar_t is UTF-16 here, so mbrtowc cannot return characters outside the
+ * BMP, and there is no wcwidth: decode UTF-8 and measure code points. */
+static size_t utf8_decode(const char *s, size_t len, unsigned *cp)
+{
+    const unsigned char *u = (const unsigned char *)s;
+    size_t n = u[0] < 0x80 ? 1 : (u[0] & 0xE0) == 0xC0 ? 2 : (u[0] & 0xF0) == 0xE0 ? 3
+             : (u[0] & 0xF8) == 0xF0 ? 4 : 0;
+    if (!n || n > len) return 0;
+    unsigned c = n == 1 ? u[0] : u[0] & (0x7Fu >> n);
+    for (size_t i = 1; i < n; i++) {
+        if ((u[i] & 0xC0) != 0x80) return 0;
+        c = c << 6 | (u[i] & 0x3Fu);
+    }
+    static const unsigned min[] = {0, 0, 0x80, 0x800, 0x10000};
+    if (c < min[n] || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) return 0;
+    *cp = c;
+    return n;
+}
+
+/* Terminal cells for a code point, like wcwidth(): -1 for control
+ * characters, 0 for combining marks, 2 for East Asian wide and emoji. */
+static int cp_width(unsigned c)
+{
+    static const unsigned zero[][2] = {
+        {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x0610, 0x061A}, {0x064B, 0x065F},
+        {0x0E31, 0x0E31}, {0x0E34, 0x0E3A}, {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF}, {0x200B, 0x200F},
+        {0x2028, 0x202E}, {0x2060, 0x2064}, {0x20D0, 0x20FF}, {0xFE00, 0xFE0F}, {0xFE20, 0xFE2F},
+        {0xFEFF, 0xFEFF}, {0xE0100, 0xE01EF},
+    };
+    static const unsigned wide[][2] = {
+        {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F3},
+        {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F}, {0x2693, 0x2693},
+        {0x26A1, 0x26A1}, {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5}, {0x26CE, 0x26CE},
+        {0x26D4, 0x26D4}, {0x26EA, 0x26EA}, {0x26F2, 0x26F5}, {0x26FA, 0x26FD}, {0x2705, 0x2705},
+        {0x270A, 0x270B}, {0x2728, 0x2728}, {0x274C, 0x274C}, {0x2753, 0x2755}, {0x2757, 0x2757},
+        {0x2795, 0x2797}, {0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50},
+        {0x2B55, 0x2B55}, {0x2E80, 0x303E}, {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF},
+        {0xA000, 0xA4CF}, {0xA960, 0xA97F}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19},
+        {0xFE30, 0xFE6F}, {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x16FE0, 0x18CFF}, {0x1B000, 0x1B2FF},
+        {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E}, {0x1F191, 0x1F19A},
+        {0x1F200, 0x1F251}, {0x1F300, 0x1F64F}, {0x1F680, 0x1F6FF}, {0x1F7E0, 0x1F7EB},
+        {0x1F90C, 0x1F9FF}, {0x1FA70, 0x1FAFF}, {0x20000, 0x3FFFD},
+    };
+    if (c < 0x20 || (c >= 0x7F && c < 0xA0)) return -1;
+    for (size_t i = 0; i < sizeof zero / sizeof *zero; i++)
+        if (c >= zero[i][0] && c <= zero[i][1]) return 0;
+    for (size_t i = 0; i < sizeof wide / sizeof *wide; i++)
+        if (c >= wide[i][0] && c <= wide[i][1]) return 2;
+    return 1;
+}
+
+/* Set while tmux owns the console during a takeover. */
+static volatile sig_atomic_t in_takeover;
+
+/* Ctrl-C and Ctrl-Break reach a console program as signals, and PDCurses,
+ * unlike ncurses, installs no handler that restores the console first.
+ * During a takeover the keys belong to tmux. */
+static void on_console_break(int sig)
+{
+    if (in_takeover) {
+        signal(sig, on_console_break);
+        return;
+    }
+    endwin();
+    _exit(130);
+}
+#endif
+
 /* Clip by terminal cells, and keep control bytes inside the current row. */
-static void put(int y, int x, int w, int attr, const char *s)
+static void put(int y, int x, int w, dattr attr, const char *s)
 {
     if (w <= 0 || y < 0 || y >= LINES || x < 0 || x >= COLS) return;
     if (w > COLS - x) w = COLS - x;
     /* Leave the bottom-right cell alone so curses never tries to scroll. */
     if (y == LINES - 1 && w == COLS - x) w--;
 
+#ifndef _WIN32
     mbstate_t state = {0};
+#endif
     size_t len = strlen(s);
     const char *run = s;
     int cols = 0;
     attrset(attr);
     move(y, x);
     while (len) {
+#ifdef _WIN32
+        unsigned ch;
+        size_t n = utf8_decode(s, len, &ch);
+        if (!n) {
+            ch = 0;
+            n = 1;
+        }
+        int width = ch ? cp_width(ch) : -1;
+#else
         wchar_t ch;
         size_t n = mbrtowc(&ch, s, len, &state);
         if (n == (size_t)-1 || n == (size_t)-2) {
@@ -479,6 +571,7 @@ static void put(int y, int x, int w, int attr, const char *s)
             n = 1;
         }
         int width = ch ? wcwidth(ch) : -1;
+#endif
         if (width == 0 && cols == 0) width = -1;
         if (width > w - cols || (width < 0 && cols == w)) break;
         if (width < 0) {
@@ -495,7 +588,7 @@ static void put(int y, int x, int w, int attr, const char *s)
     attrset(A_NORMAL);
 }
 
-__attribute__((format(printf, 5, 6))) static void putf(int y, int x, int w, int attr, const char *fmt, ...)
+NQ_PRINTF(5, 6) static void putf(int y, int x, int w, dattr attr, const char *fmt, ...)
 {
     char buf[1024];
     va_list ap;
@@ -505,7 +598,7 @@ __attribute__((format(printf, 5, 6))) static void putf(int y, int x, int w, int 
     put(y, x, w, attr, buf);
 }
 
-static int state_attr(const char *state)
+static dattr state_attr(const char *state)
 {
     if (!state) return A_DIM;
     if (!strcmp(state, "idle")) return COLOR_PAIR(C_IDLE);
@@ -528,7 +621,7 @@ static int pane_agents(const dash_t *d, const cJSON **out, int max)
 
 /* ---- separators: heavy dark-blue rules ---------------------------------- */
 
-static int sep_attr(void) { return has_colors() ? COLOR_PAIR(C_SEP) | A_BOLD : A_BOLD; }
+static dattr sep_attr(void) { return has_colors() ? COLOR_PAIR(C_SEP) | A_BOLD : A_BOLD; }
 
 /* Heavy box-drawing glyphs need a UTF-8 locale; otherwise fall back to ACS. */
 static int heavy_ok(void) { return MB_CUR_MAX > 1; }
@@ -631,7 +724,7 @@ static void draw_agents_list(dash_t *d, const cJSON **agents, int n, int y, int 
         const cJSON *a = agents[i];
         const char *name = jstr(a, "name"), *state = jstr(a, "state");
         int row = y + 1 + i - d->top;
-        int active = i == d->sel ? A_REVERSE : A_NORMAL;
+        dattr active = i == d->sel ? A_REVERSE : A_NORMAL;
         attrset(active);
         mvhline(row, 1, ' ', w - 2);
         attrset(A_NORMAL);
@@ -968,7 +1061,7 @@ static void draw_agents(dash_t *d, const cJSON **agents, int n, int y, int h, in
 
 typedef struct {
     int fg, bg; /* -1: default */
-    int attr;
+    dattr attr;
 } sgr_t;
 
 static const sgr_t SGR_RESET = {-1, -1, 0};
@@ -1023,7 +1116,7 @@ static short curses_color(int c)
 
 /* Colour pairs are made on demand. COLOR_PAIR() holds 8 bits, so at most
  * 255 pairs; past that, extra combinations fall back to the default. */
-static int pair_attr(int fg, int bg)
+static dattr pair_attr(int fg, int bg)
 {
     if (!has_colors() || (fg < 0 && bg < 0)) return 0;
     short f = curses_color(fg), b = curses_color(bg);
@@ -1036,7 +1129,7 @@ static int pair_attr(int fg, int bg)
     return COLOR_PAIR(n_dyn++);
 }
 
-static int sgr_attr(const sgr_t *st) { return st->attr | pair_attr(st->fg, st->bg); }
+static dattr sgr_attr(const sgr_t *st) { return st->attr | pair_attr(st->fg, st->bg); }
 
 static void sgr_apply(sgr_t *st, const char *p, const char *end)
 {
@@ -1127,6 +1220,16 @@ static const char *ansi_escape(const char *s, sgr_t *st)
 /* Cells a character takes, the way put() counts them. */
 static int char_cells(const char *s, size_t len, size_t *used)
 {
+#ifdef _WIN32
+    unsigned ch;
+    size_t n = utf8_decode(s, len, &ch);
+    if (n == 0) {
+        *used = 1;
+        return 1;
+    }
+    *used = n;
+    int w = cp_width(ch);
+#else
     mbstate_t state = {0};
     wchar_t ch;
     size_t n = mbrtowc(&ch, s, len, &state);
@@ -1136,6 +1239,7 @@ static int char_cells(const char *s, size_t len, size_t *used)
     }
     *used = n;
     int w = wcwidth(ch);
+#endif
     return w < 0 ? 1 : w;
 }
 
@@ -1396,7 +1500,7 @@ static void draw_tabs(const dash_t *d, int y, int w, size_t nfiles)
     char files[48];
     snprintf(files, sizeof files, " Changed files %zu ", nfiles);
     const char *term = d->term_focus ? " Terminal (typing) " : " Terminal ";
-    int on = A_BOLD | A_REVERSE, off = A_DIM;
+    dattr on = A_BOLD | A_REVERSE, off = A_DIM;
     int x = 2;
     put(y, x, w - x - 1, d->tab == TAB_FILES ? on : off, files);
     x += (int)strlen(files) + 1;
@@ -1660,6 +1764,11 @@ static void prompt_line(const char *label, char *buf, size_t len)
     echo();
     curs_set(1);
     nodelay(stdscr, FALSE);
+#ifdef _WIN32
+    /* Undo the main loop's timeout(100) as well: PDCurses' getnstr does not
+     * expect its reads to time out and stores a junk character each time. */
+    timeout(-1);
+#endif
     getnstr(buf, (int)len - 1);
     nodelay(stdscr, TRUE);
     curs_set(0);
@@ -1715,8 +1824,17 @@ static void takeover(dash_t *d, const cJSON *a)
     paste_mode(0);
     def_prog_mode();
     endwin();
+#ifdef _WIN32
+    in_takeover = 1;
+    tmux_takeover(d->c->p.session, pane);
+    in_takeover = 0;
+    reset_prog_mode();
+    /* The console may have been resized while tmux had it. */
+    resize_term(0, 0);
+#else
     tmux_takeover(d->c->p.session, pane);
     reset_prog_mode();
+#endif
     paste_mode(1);
     clearok(stdscr, TRUE);
     flushinp();
@@ -1813,15 +1931,23 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
     if (argc > 0 && !strcmp(argv[0], "--once")) return print_once(&d);
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) die("the dashboard needs a terminal (try: nuq dash --once)");
 
+#ifdef _WIN32
+    /* "" would select the ANSI code page; all text here is UTF-8. */
+    setlocale(LC_ALL, ".UTF-8");
+#else
     setlocale(LC_ALL, "");
+#endif
     initscr();
     raw();
     noecho();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
-    /* Esc on its own must reach the shell promptly, not after a second. */
+#ifndef _WIN32
+    /* Esc on its own must reach the shell promptly, not after a second.
+     * (PDCurses reads console key events and has no such delay.) */
     set_escdelay(25);
+#endif
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -1832,10 +1958,17 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
         init_pair(C_TOPIC, COLOR_MAGENTA, -1);
         init_pair(C_SEP, COLORS >= 256 ? SEP_COLOR_256 : COLOR_BLUE, -1);
     }
+#ifdef _WIN32
+    signal(SIGINT, on_console_break);
+    signal(SIGBREAK, on_console_break);
+#endif
 
     if (tmux_inside_session(c->p.session)) d.own_pane = getenv("TMUX_PANE");
+#ifndef _WIN32
+    /* PDCurses has no define_key; the Windows console pastes as key events. */
     paste_supported = define_key("\033[200~", KEY_PASTE_START) == OK &&
                       define_key("\033[201~", KEY_PASTE_END) == OK;
+#endif
     paste_mode(1);
 
     int quit = 0, dirty = 1, pasting = 0;
@@ -1857,8 +1990,17 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
             dirty = 0;
         }
 
+#ifdef _WIN32
+        /* Console input and the SUB socket cannot be waited on together:
+         * wait briefly for a key, then drain the socket without blocking. */
+        timeout(d.term_focus ? 60 : 100);
+        int key = getch();
+        nodelay(stdscr, TRUE);
+        if (key != ERR) ungetch(key);
+#else
         struct pollfd pfd[2] = {{STDIN_FILENO, POLLIN, 0}, {d.subfd, POLLIN, 0}};
         poll(pfd, d.subfd >= 0 ? 2 : 1, d.term_focus ? 60 : now < d.animate_until ? 90 : CHAT_REFRESH_MS);
+#endif
         /* Refresh the roster before drawing again, so input in this frame
          * still targets the pane already on screen. */
         if (drain_events(&d)) d.t_stats = 0;
@@ -1888,6 +2030,19 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
             }
             if (pasting) continue;
             dirty = 1;
+#ifdef _WIN32
+            /* PDCurses reports a resized console but leaves the resize to us. */
+            if (ch == KEY_RESIZE) {
+                /* resize_term() flushes the console's input buffer, which
+                 * would lose keys typed meanwhile; the ungetch stack survives. */
+                int keep[64], n = 0;
+                for (int k; n < 64 && (k = getch()) != ERR;)
+                    if (k != KEY_RESIZE) keep[n++] = k;
+                resize_term(0, 0);
+                while (n > 0) ungetch(keep[--n]);
+                continue;
+            }
+#endif
             if (d.help) {
                 switch (ch) {
                 case KEY_UP: case 'k':

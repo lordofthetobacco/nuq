@@ -17,6 +17,10 @@ int bus_pub_bind(const char *url);
 /* File descriptor that becomes readable when a message is waiting. Only for
  * poll(); never read from it. */
 int bus_rcvfd(int sock);
+/* Waits until sock has a message (1), timeout_ms passes (0; -1 waits
+ * forever), or the wait is interrupted or fails (-1). Portable alternative to
+ * poll() on bus_rcvfd, whose descriptor is a SOCKET on Windows. */
+int bus_wait(int sock, int timeout_ms);
 
 /* Client side. */
 int bus_req_connect(const char *url, int timeout_ms);

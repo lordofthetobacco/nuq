@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "bus.h"
 #include "daemon.h"
@@ -62,10 +64,19 @@ static char *collect_body(int argc, char **argv, int i)
         return sb.p;
     }
     if (isatty(STDIN_FILENO)) die("no message text (pass it as arguments or on stdin)");
+#ifdef _WIN32
+    /* Text mode would turn CRLF into LF and stop at a Ctrl-Z byte. */
+    _setmode(STDIN_FILENO, _O_BINARY);
+#endif
     size_t len = 0;
     char *body = read_fd_all(STDIN_FILENO, 2 * NQ_MAX_BODY, &len);
     if (!body) die("message too large (limit %d bytes)", NQ_MAX_BODY);
     while (len > 0 && (body[len - 1] == '\n' || body[len - 1] == '\r')) body[--len] = '\0';
+#ifdef _WIN32
+    /* PowerShell starts what it pipes to a program with a UTF-8 BOM when
+     * $OutputEncoding is UTF-8. */
+    if (len >= 3 && !memcmp(body, "\xEF\xBB\xBF", 3)) memmove(body, body + 3, len - 2);
+#endif
     return body;
 }
 
@@ -428,7 +439,9 @@ int cmd_tail(nq_ctx *c, int argc, char **argv)
     bus_sub_add(sub, "st/");
     bus_sub_add(sub, "ev ");
     bus_set_rcvtimeo(sub, 2000);
+#ifndef _WIN32
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 
     for (;;) {
         char *frame = bus_recv(sub, 0, NULL);
@@ -445,6 +458,8 @@ int cmd_tail(nq_ctx *c, int argc, char **argv)
         if (o) {
             print_time((uint64_t)jnum(o, "ts", (double)now_ms()));
             puts(line.p ? line.p : "");
+            /* The MSVC CRT has no line buffering (_IOLBF is full buffering). */
+            fflush(stdout);
         }
         sb_free(&line);
         cJSON_Delete(o);
@@ -497,9 +512,22 @@ int cmd_attach(nq_ctx *c, int argc, char **argv)
     snprintf(target, sizeof target, "=%s", c->p.session);
     const char *sock = getenv("NUQ_TMUX_SOCKET");
     const char *verb = getenv("TMUX") ? "switch-client" : "attach-session";
+#ifdef _WIN32
+    /* psmux mirrors the last attached session's options into the global
+     * ones, so the grid's key table only holds if it is set right before
+     * the attach; tmux_takeover does that (and restores the globals). */
+    if (!getenv("TMUX")) return tmux_takeover(c->p.session, NULL);
+    /* No exec on Windows: run tmux on this console and pass its status on. */
+    const char *argv_sock[] = {"tmux", "-L", sock, verb, "-t", target, NULL};
+    const char *argv_plain[] = {"tmux", verb, "-t", target, NULL};
+    int rc = nq_spawn_wait(sock && *sock ? argv_sock : argv_plain);
+    if (rc < 0) die("cannot run tmux");
+    return rc;
+#else
     if (sock && *sock)
         execlp("tmux", "tmux", "-L", sock, verb, "-t", target, (char *)NULL);
     else
         execlp("tmux", "tmux", verb, "-t", target, (char *)NULL);
     die("cannot run tmux");
+#endif
 }

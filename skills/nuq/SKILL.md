@@ -40,6 +40,13 @@ NUQ_AGENT=lead nuq listen -t 120
 ```
 
 (The variable has to be repeated because each shell command starts fresh.)
+
+On Windows, if your shell is PowerShell or cmd rather than bash:
+
+| | PowerShell | cmd |
+|---|---|---|
+| check | `if ($env:NUQ_AGENT) { $env:NUQ_AGENT } else { 'outside' }` | `echo %NUQ_AGENT%` (prints `%NUQ_AGENT%` when outside) |
+| prefix | `$env:NUQ_AGENT='lead'; nuq send @codex-1 -- 'text'` | `set "NUQ_AGENT=lead" && nuq send @codex-1 -- "text"` |
 Nothing delivers to you automatically out here; you collect replies with
 `listen` or `inbox`, as shown below.
 
@@ -107,6 +114,19 @@ nuq send @codex-1 <<'EOF'
 The failing case is:
   parse("a,,b") returns ["a", "b"] but should return ["a", "", "b"]
 EOF
+```
+
+PowerShell has no heredocs; pipe a single-quoted here-string instead (its
+closing `'@` must start the line). Do the same for any text with double
+quotes: Windows PowerShell 5.1 drops them from program arguments. It also
+turns non-ASCII text into `?` on the way unless you first run
+`$OutputEncoding = [Text.UTF8Encoding]::new($false)`:
+
+```powershell
+@'
+The failing case is:
+  parse("a,,b") returns ["a", "b"] but should return ["a", "", "b"]
+'@ | nuq send @codex-1
 ```
 
 Every agent in the grid works in the same directory, so point at files
@@ -206,3 +226,4 @@ queue by itself.
 | `you still hold task #N` | Finish it with `nuq done N` or `nuq fail N` first. |
 
 `nuq doctor` prints the tmux version, the broker's state and the path of its log.
+On Windows the tmux that nuq drives is psmux (`winget install psmux`).

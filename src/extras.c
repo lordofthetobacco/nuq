@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "cli.h"
 #include "daemon.h"
@@ -36,6 +38,10 @@ int cmd_doctor(nq_ctx *c, int argc, char **argv)
         bad += check(1, "tmux", ver.p);
     else
         bad += check(0, "tmux", err);
+#ifdef _WIN32
+    /* On Windows "tmux" is psmux, which installs a tmux.exe. */
+    if (!ver.p) printf("        %-22s install it with: winget install psmux\n", "");
+#endif
     sb_free(&ver);
 
     char self[PATH_MAX] = "";
@@ -62,6 +68,10 @@ int cmd_doctor(nq_ctx *c, int argc, char **argv)
         bad += check(0, "runtime directory", err);
 
     const char *shell = getenv("SHELL");
+#ifdef _WIN32
+    /* Only Git Bash and the like set SHELL; cmd and PowerShell do not. */
+    if (!shell || !*shell) shell = getenv("ComSpec");
+#endif
     check(1, "shell", shell ? shell : "(SHELL is not set)");
 
     if (daemon_alive(&c->p)) {
@@ -106,7 +116,7 @@ static const char BASH_COMPLETION[] =
     "        COMPREPLY=($(compgen -W \"$names\" -- \"$cur\"))\n"
     "        ;;\n"
     "    completion)\n"
-    "        COMPREPLY=($(compgen -W \"bash zsh\" -- \"$cur\"))\n"
+    "        COMPREPLY=($(compgen -W \"bash zsh powershell\" -- \"$cur\"))\n"
     "        ;;\n"
     "    skills)\n"
     "        COMPREPLY=($(compgen -W \"status install show\" -- \"$cur\"))\n"
@@ -169,7 +179,7 @@ static const char ZSH_COMPLETION[] =
     "        names=(${(f)\"$(nuq ls 2>/dev/null | awk 'NR > 1 && NF >= 6 && $6 != \"-\" { print $1 }')\"})\n"
     "        compadd -a names\n"
     "        ;;\n"
-    "    completion) compadd bash zsh ;;\n"
+    "    completion) compadd bash zsh powershell ;;\n"
     "    skills) compadd status install show ;;\n"
     "    inbox) compadd -- --peek ;;\n"
     "    work) compadd -- --all ;;\n"
@@ -182,6 +192,31 @@ static const char ZSH_COMPLETION[] =
     "    compdef _nuq nuq\n"
     "fi\n";
 
+/* Commands only, and agent names after send and kill. */
+static const char POWERSHELL_COMPLETION[] =
+    "# nuq completion for PowerShell. Load with:\n"
+    "#   nuq completion powershell | Out-String | Invoke-Expression\n"
+    "Register-ArgumentCompleter -Native -CommandName nuq, nuq.exe -ScriptBlock {\n"
+    "    param($word, $ast, $cursor)\n"
+    "    $w = @($ast.CommandElements | ForEach-Object { $_.ToString() })\n"
+    "    $n = if ($word) { $w.Count - 1 } else { $w.Count }\n"
+    "    $list = if ($n -le 1) {\n"
+    "        'claude codex run send pub sub unsub push take done fail inbox listen show ls tail work attach kill nuke up doctor completion skills version help' -split ' '\n"
+    "    } else {\n"
+    "        switch ($w[1]) {\n"
+    "            'send' { if ($n -eq 2) { @('@all') + @(nuq ls 2>$null | Select-Object -Skip 1 | ForEach-Object { $f = -split $_; if ($f.Count -ge 6) { '@' + $f[0] } }) } }\n"
+    "            'kill' { @(nuq ls 2>$null | Select-Object -Skip 1 | ForEach-Object { $f = -split $_; if ($f.Count -ge 6 -and $f[5] -ne '-') { $f[0] } }) }\n"
+    "            'completion' { 'bash', 'zsh', 'powershell' }\n"
+    "            'skills' { 'status', 'install', 'show' }\n"
+    "            'inbox' { '--peek' }\n"
+    "            'work' { '--all' }\n"
+    "        }\n"
+    "    }\n"
+    "    $list | Where-Object { $_ -like \"$word*\" } | ForEach-Object {\n"
+    "        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n"
+    "    }\n"
+    "}\n";
+
 int cmd_completion(nq_ctx *c, int argc, char **argv)
 {
     (void)c;
@@ -193,7 +228,11 @@ int cmd_completion(nq_ctx *c, int argc, char **argv)
         fputs(ZSH_COMPLETION, stdout);
         return 0;
     }
-    die("usage: nuq completion bash|zsh");
+    if (argc == 1 && !strcmp(argv[0], "powershell")) {
+        fputs(POWERSHELL_COMPLETION, stdout);
+        return 0;
+    }
+    die("usage: nuq completion bash|zsh|powershell");
 }
 
 /* ---- nuq skills ------------------------------------------------------- */
@@ -225,7 +264,7 @@ static const struct {
 static char *skills_dir_of(size_t i)
 {
     sb_t root = {0};
-    const char *over = getenv(SKILL_HOMES[i].env), *home = getenv("HOME");
+    const char *over = getenv(SKILL_HOMES[i].env), *home = nq_home();
     if (over && *over)
         sb_adds(&root, over);
     else if (home && *home)
@@ -242,7 +281,7 @@ static char *skills_dir_of(size_t i)
 
 static int skill_state(const char *file)
 {
-    int fd = open(file, O_RDONLY);
+    int fd = open(file, O_RDONLY | NQ_O_BINARY);
     if (fd < 0) return SKILL_MISSING;
     size_t len = 0;
     char *have = read_fd_all(fd, 16 * 1024 * 1024, &len);
@@ -273,7 +312,7 @@ static int install_skill(const char *label, const char *skills_dir)
         rc = -1;
     } else {
         /* Write beside the target and rename, so a reader never sees half. */
-        int fd = open(tmp.p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = open(tmp.p, O_WRONLY | O_CREAT | O_TRUNC | NQ_O_BINARY, 0644);
         size_t off = 0;
         while (fd >= 0 && off < nq_skill_md_len) {
             ssize_t n = write(fd, nq_skill_md + off, nq_skill_md_len - off);
@@ -285,9 +324,10 @@ static int install_skill(const char *label, const char *skills_dir)
             unlink(tmp.p);
             rc = -1;
         } else {
-            if (before == SKILL_DIFFERENT && rename(file.p, bak.p) == 0)
+            /* rename() on Windows refuses to replace an existing file. */
+            if (before == SKILL_DIFFERENT && nq_rename_replace(file.p, bak.p) == 0)
                 result = "updated (previous copy kept as SKILL.md.bak)";
-            if (rename(tmp.p, file.p) < 0) {
+            if (nq_rename_replace(tmp.p, file.p) < 0) {
                 snprintf(why, sizeof why, "cannot write %s: %s", file.p, strerror(errno));
                 unlink(tmp.p);
                 rc = -1;

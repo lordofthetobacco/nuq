@@ -3,6 +3,15 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#include <sddl.h>
+#include <stdio.h>
+#else
+#include <poll.h>
+#endif
+
 #include <nng/nng.h>
 
 #include "util.h"
@@ -16,6 +25,47 @@ static int fail(int rv)
     last_err = (nng_err)rv;
     return -1;
 }
+
+#ifdef _WIN32
+/* The broker's endpoints are named pipes on Windows. NNG calls those
+ * winpipe://; its ipc:// is a Unix socket file there, which the access
+ * control below would not cover. Callers keep saying ipc://. */
+static const char *pipe_url(const char *url, char *buf, size_t len)
+{
+    if (strncmp(url, "ipc://", 6) != 0) return url;
+    snprintf(buf, len, "winpipe://%s", url + 6);
+    return buf;
+}
+
+/* A named pipe may by default be opened for reading by every local account.
+ * Only this user (and SYSTEM) may use ours, the way the private runtime
+ * directory guards the Unix sockets. NNG keeps the pointer, so the
+ * descriptor lives as long as the process. */
+static PSECURITY_DESCRIPTOR pipe_security(void)
+{
+    static PSECURITY_DESCRIPTOR sd;
+    static int done;
+    if (done) return sd;
+    done = 1;
+    HANDLE tok;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return NULL;
+    union {
+        TOKEN_USER user;
+        char buf[256];
+    } info;
+    DWORD n = 0;
+    char *sid = NULL;
+    BOOL ok = GetTokenInformation(tok, TokenUser, &info, sizeof info, &n) &&
+              ConvertSidToStringSidA(info.user.User.Sid, &sid);
+    CloseHandle(tok);
+    if (!ok) return NULL;
+    char sddl[256];
+    snprintf(sddl, sizeof sddl, "D:P(A;;GA;;;%s)(A;;GA;;;SY)", sid);
+    LocalFree(sid);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, NULL)) sd = NULL;
+    return sd;
+}
+#endif
 
 /* NNG sockets are structs holding a positive id. The id is what callers see
  * as the socket number, so the bus API keeps using plain ints. */
@@ -51,7 +101,16 @@ static int bind_socket(int (*open_fn)(nng_socket *), const char *url)
     if (open_socket(open_fn, &s) < 0) return -1;
     /* A vanished peer must never be able to stall the broker. */
     nng_socket_set_ms(s, NNG_OPT_SENDTIMEO, 1000);
+#ifdef _WIN32
+    char pipe[256];
+    nng_listener l;
+    PSECURITY_DESCRIPTOR sd = pipe_security();
+    int rv = sd ? nng_listener_create(&l, s, pipe_url(url, pipe, sizeof pipe)) : NNG_EPERM;
+    if (rv == 0) rv = nng_listener_set_security_descriptor(l, sd);
+    if (rv == 0) rv = nng_listener_start(l, 0);
+#else
     int rv = nng_listen(s, url, NULL, 0);
+#endif
     if (rv != 0) {
         nng_socket_close(s);
         return fail(rv);
@@ -76,6 +135,26 @@ int bus_rcvfd(int sock)
     return rv != 0 ? fail(rv) : fd;
 }
 
+int bus_wait(int sock, int timeout_ms)
+{
+#ifdef _WIN32
+    /* NNG's descriptor is a loopback SOCKET here, which only select() takes. */
+    int rcv = bus_rcvfd(sock);
+    if (rcv < 0) return -1;
+    SOCKET fd = (SOCKET)rcv;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    int n = select(0, &rd, NULL, NULL, timeout_ms < 0 ? NULL : &tv);
+#else
+    struct pollfd pfd = {bus_rcvfd(sock), POLLIN, 0};
+    if (pfd.fd < 0) return -1;
+    int n = poll(&pfd, 1, timeout_ms);
+#endif
+    return n < 0 ? -1 : n > 0;
+}
+
 int bus_set_rcvtimeo(int sock, int timeout_ms)
 {
     int rv = nng_socket_set_ms(sock_of(sock), NNG_OPT_RECVTIMEO, timeout_ms);
@@ -95,6 +174,10 @@ static int connect_socket(int (*open_fn)(nng_socket *), const char *url, int tim
     }
     /* Non-blocking dial: like nn_connect, succeed even when the broker is
      * not listening yet and keep reconnecting in the background. */
+#ifdef _WIN32
+    char pipe[256];
+    url = pipe_url(url, pipe, sizeof pipe);
+#endif
     int rv = nng_dial(s, url, NULL, NNG_FLAG_NONBLOCK);
     if (rv != 0) {
         nng_socket_close(s);

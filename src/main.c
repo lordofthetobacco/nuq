@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "cli.h"
 #include "daemon.h"
@@ -60,6 +62,7 @@ static const struct {
 
 int main(int argc, char **argv)
 {
+    nq_console_init();
     const char *dir = NULL;
     nq_launch_opts opts = {0};
     int i = 1;
@@ -112,7 +115,7 @@ int main(int argc, char **argv)
         die("%s", err);
     }
     ctx.me = getenv("NUQ_AGENT");
-    if (!ctx.me || !valid_name(ctx.me)) ctx.me = getenv("USER");
+    if (!ctx.me || !valid_name(ctx.me)) ctx.me = nq_user();
     if (!ctx.me || !valid_name(ctx.me)) ctx.me = "human";
 
     if (!strcmp(cmd, "daemon")) return cmd_daemon(&ctx.p);

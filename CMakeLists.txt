@@ -9,15 +9,40 @@ option(NUQ_SYSTEM_NNG "Link an installed NNG 2.x instead of building the pinned 
 option(NUQ_SANITIZE "Build nuq with AddressSanitizer and UBSan" OFF)
 option(NUQ_TESTS "Build the test suite" ON)
 
+# Windows: link the C runtime statically, so nuq.exe runs on machines without
+# the Visual C++ redistributable and inside panes whatever their PATH.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 include(cmake/Nng.cmake)
 
-set(CURSES_NEED_NCURSES TRUE)
-# macOS ncurses already renders multibyte text. Linux ships a separate
-# wide-character library for the dashboard's UTF-8 text.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(CURSES_NEED_WIDE TRUE)
+if(WIN32)
+  # Native Windows has no curses; PDCursesMod (wincon port) stands in.
+  include(cmake/PDCursesMod.cmake)
+  set(CURSES_LIBRARIES nuq_pdcurses)
+  set(CURSES_INCLUDE_DIRS "")
+else()
+  set(CURSES_NEED_NCURSES TRUE)
+  # macOS ncurses already renders multibyte text. Linux ships a separate
+  # wide-character library for the dashboard's UTF-8 text.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CURSES_NEED_WIDE TRUE)
+  endif()
+  find_package(Curses REQUIRED)
 endif()
-find_package(Curses REQUIRED)
+
+# Warning flags for nuq's own targets (third-party code keeps its defaults).
+if(MSVC)
+  # C4244/C4267: implicit integer narrowing, which -Wall -Wextra does not
+  # report either (that is -Wconversion). C4706: assignment used as a
+  # condition, written deliberately in parenthesised loop conditions.
+  # The _CRT_* defines silence "use the _s / _-prefixed variant" advice for
+  # the standard and POSIX names the code base uses on purpose.
+  set(NQ_WARN_FLAGS /W4 /wd4244 /wd4267 /wd4706)
+  set(NQ_PLATFORM_DEFS _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+else()
+  set(NQ_WARN_FLAGS -Wall -Wextra -Wpedantic -Wshadow)
+  set(NQ_PLATFORM_DEFS _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE _DARWIN_C_SOURCE)
+endif()
 
 add_library(cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(cjson SYSTEM PUBLIC third_party/cjson)
@@ -34,8 +59,23 @@ add_custom_command(
   COMMENT "Embedding skills/nuq/SKILL.md"
   VERBATIM)
 
+if(WIN32)
+  set(NQ_COMPAT_C src/compat_win.c)
+else()
+  set(NQ_COMPAT_C src/compat_posix.c)
+endif()
+
+# Every Windows executable carries a manifest that makes the process code
+# page UTF-8, so argv, getenv, fopen and CreateProcessA all speak UTF-8.
+# Interface sources reach every executable that links nuq_core.
+add_library(nuq_manifest INTERFACE)
+if(WIN32)
+  target_sources(nuq_manifest INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/nuq.manifest)
+endif()
+
 add_library(nuq_core STATIC
   ${NQ_SKILL_C}
+  ${NQ_COMPAT_C}
   src/util.c
   src/paths.c
   src/bus.c
@@ -54,20 +94,27 @@ add_library(nuq_core STATIC
 )
 target_include_directories(nuq_core PUBLIC src)
 target_compile_definitions(nuq_core PUBLIC
-  _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE _DARWIN_C_SOURCE
+  ${NQ_PLATFORM_DEFS}
   NQ_VERSION="${PROJECT_VERSION}")
-target_compile_options(nuq_core PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
-target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} PRIVATE nuq_nng)
-target_include_directories(nuq_core SYSTEM PRIVATE ${CURSES_INCLUDE_DIRS})
+target_compile_options(nuq_core PRIVATE ${NQ_WARN_FLAGS})
+target_link_libraries(nuq_core PUBLIC cjson ${CURSES_LIBRARIES} nuq_manifest PRIVATE nuq_nng)
+if(CURSES_INCLUDE_DIRS)
+  target_include_directories(nuq_core SYSTEM PRIVATE ${CURSES_INCLUDE_DIRS})
+endif()
 
 add_executable(nuq src/main.c)
-target_compile_options(nuq PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
+target_compile_options(nuq PRIVATE ${NQ_WARN_FLAGS})
 target_link_libraries(nuq PRIVATE nuq_core)
 
 if(NUQ_SANITIZE)
   foreach(t nuq_core nuq)
-    target_compile_options(${t} PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(${t} PUBLIC -fsanitize=address,undefined)
+    if(MSVC)
+      # MSVC has AddressSanitizer but no UBSan.
+      target_compile_options(${t} PUBLIC /fsanitize=address)
+    else()
+      target_compile_options(${t} PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+      target_link_options(${t} PUBLIC -fsanitize=address,undefined)
+    endif()
   endforeach()
 endif()
 
