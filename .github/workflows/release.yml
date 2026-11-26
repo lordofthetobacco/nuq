@@ -153,9 +153,10 @@ jobs:
           arch: amd64
 
       # The default shell is bash on Linux and macOS and PowerShell on
-      # Windows; these three lines mean the same in both.
+      # Windows; these three lines mean the same in both. (Unquoted,
+      # PowerShell would split -DNUQ_VERSION=0.1.0 at the first dot.)
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DNUQ_VERSION=${{ needs.version.outputs.version }} ${{ matrix.cmake_args }}
+        run: cmake --preset ${{ matrix.preset }} "-DNUQ_VERSION=${{ needs.version.outputs.version }}" ${{ matrix.cmake_args }}
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       # ci runs the whole suite on debug builds; this checks the release build.
