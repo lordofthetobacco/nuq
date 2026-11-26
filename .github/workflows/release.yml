@@ -1,0 +1,226 @@
+name: release
+
+# Tests main and publishes the nuq packages as a GitHub release.
+#
+#   push to main                     run ci; if it passes and anything that
+#                                    ends up in the binary changed since the
+#                                    last release, release
+#   run by hand on main              the same; "force" releases even when
+#                                    nothing changed
+#   run by hand on another branch,   dry run: the packages are built and
+#   or a pull request touching the   kept as workflow artifacts, nothing is
+#   build or this file               tagged or published
+#
+# Versions: the next release is the latest vX.Y.Z tag with Z raised by one.
+# To start a new minor or major line, raise the version in CMakeLists.txt
+# (`project(nuq VERSION ...)`): a version there that is ahead of every tag
+# is released as it is.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Release even if nothing in the binary changed
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - CMakeLists.txt
+      - CMakePresets.json
+      - cmake/**
+
+permissions:
+  contents: read
+
+# One run at a time on main, so two releases never pick the same version.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The whole test suite. Pull requests get it from ci.yml itself.
+  ci:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      publish: ${{ steps.next.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # All history and tags: the version comes from the tags.
+          fetch-depth: 0
+      - name: Next version
+        id: next
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          semver='[0-9]+\.[0-9]+\.[0-9]+'
+          base=$(grep -Eo "^project\(nuq VERSION $semver" CMakeLists.txt | grep -Eo "$semver" || true)
+          [ -n "$base" ] || { echo "::error::CMakeLists.txt has no project(nuq VERSION x.y.z)"; exit 1; }
+          latest=$(git tag --list 'v*' | grep -Ex "v$semver" | sed 's/^v//' | sort -V | tail -n 1 || true)
+
+          # What a release is made of. Tests, workflows and notes are not.
+          inputs="CMakeLists.txt CMakePresets.json cmake src third_party skills"
+          publish=true
+          why="first release"
+          if [ -z "$latest" ]; then
+              next=$base
+          elif [ "$(printf '%s\n' "$base" "$latest" | sort -V | tail -n 1)" != "$latest" ]; then
+              next=$base
+              why="CMakeLists.txt is ahead of v$latest"
+          else
+              next="${latest%.*}.$((${latest##*.} + 1))"
+              why="patch after v$latest"
+              # shellcheck disable=SC2086
+              if [ "$FORCE" != true ] && git diff --quiet "v$latest" HEAD -- $inputs; then
+                  publish=false
+                  why="nothing in the binary changed since v$latest"
+              fi
+          fi
+
+          # Only main is released; everything else is a dry run.
+          case "$EVENT" in
+          pull_request)
+              publish=false
+              next="$next-pr$PR"
+              why="dry run for pull request #$PR"
+              ;;
+          workflow_dispatch)
+              if [ "$GITHUB_REF" != refs/heads/main ]; then
+                  publish=false
+                  next="$next-dev"
+                  why="dry run: $GITHUB_REF_NAME is not main"
+              fi
+              ;;
+          esac
+
+          echo "version=$next" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "nuq $next, publish: $publish ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  package:
+    needs: [ci, version]
+    # ci must not have failed (it is skipped for pull requests). A push to
+    # main that brought nothing to release builds no packages.
+    if: >-
+      !cancelled() && !failure() && needs.version.result == 'success' &&
+      (needs.version.outputs.publish == 'true' || github.event_name != 'push')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu on offer, so the binary asks for an old glibc.
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            preset: release
+          - os: ubuntu-22.04-arm
+            target: linux-aarch64
+            preset: release
+          - os: macos-latest
+            target: macos-universal
+            preset: release
+            cmake_args: '"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0'
+          - os: windows-latest
+            target: windows-x86_64
+            preset: windows-release
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: nuq-${{ needs.version.outputs.version }}-${{ matrix.target }}
+      BUILD: build/${{ matrix.preset }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libncurses-dev
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Developer environment (MSVC, CMake, Ninja)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      # The default shell is bash on Linux and macOS and PowerShell on
+      # Windows; these three lines mean the same in both. (Unquoted,
+      # PowerShell would split -DNUQ_VERSION=0.1.0 at the first dot.)
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} "-DNUQ_VERSION=${{ needs.version.outputs.version }}" ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      # ci runs the whole suite on debug builds; this checks the release build.
+      - name: Unit tests
+        run: ctest --preset ${{ matrix.preset }} -R '^core$'
+
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          [ "$("$BUILD/nuq" version)" = "nuq $VERSION" ] || { echo "::error::nuq does not report $VERSION"; exit 1; }
+          cmake --install "$BUILD" --prefix "stage/$NAME" --strip
+          mkdir "stage/$NAME/LICENSES"
+          cp third_party/cjson/LICENSE "stage/$NAME/LICENSES/cJSON.txt"
+          cp "$BUILD/_deps/nng-src/LICENSE.txt" "stage/$NAME/LICENSES/NNG.txt"
+          tar -C stage -czf "$NAME.tar.gz" "$NAME"
+          tar -tzf "$NAME.tar.gz"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reported = & "$env:BUILD/nuq.exe" version
+          if ($reported -ne "nuq $env:VERSION") { throw "nuq reports '$reported', not $env:VERSION" }
+          cmake --install $env:BUILD --prefix "stage/$env:NAME"
+          if ($LASTEXITCODE) { throw 'cmake --install failed' }
+          New-Item -ItemType Directory "stage/$env:NAME/LICENSES" | Out-Null
+          Copy-Item third_party/cjson/LICENSE "stage/$env:NAME/LICENSES/cJSON.txt"
+          Copy-Item "$env:BUILD/_deps/nng-src/LICENSE.txt" "stage/$env:NAME/LICENSES/NNG.txt"
+          Compress-Archive -Path "stage/$env:NAME" -DestinationPath "$env:NAME.zip"
+          Get-ChildItem -Recurse -File "stage/$env:NAME" | ForEach-Object FullName
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.NAME }}.tar.gz
+            ${{ env.NAME }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [version, package]
+    if: >-
+      !cancelled() && needs.package.result == 'success' &&
+      needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the tag and the release
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum nuq-* >SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: >-
+          gh release create "$TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --target "$GITHUB_SHA"
+          --title "nuq ${TAG#v}"
+          --generate-notes
