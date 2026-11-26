@@ -5,13 +5,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 int tmux_argv(av_t *args, const char *in, sb_t *out)
 {
     av_t av = {0};
     const char *sock = getenv("NUQ_TMUX_SOCKET");
+#ifdef _WIN32
+    /* Otherwise psmux keeps a spare "warm" server and pre-started shells,
+     * sitting in the grid directory: they outlive `nuq down` and keep the
+     * directory from being deleted. Servers inherit this from the client
+     * that starts them. */
+    if (!getenv("PSMUX_NO_WARM")) nq_setenv("PSMUX_NO_WARM", "1");
+#endif
     av_add(&av, "tmux");
     if (sock && *sock) {
         av_add(&av, "-L");
@@ -109,6 +118,12 @@ int tmux_enter(const char *pane)
 int tmux_set_label(const char *pane, const char *label)
 {
     /* A user option rather than the pane title: agents overwrite the title. */
+#ifdef _WIN32
+    /* psmux draws pane borders with only built-in variables expanded, so
+     * the label goes into the title too; psmux does not let the program in
+     * the pane change it. */
+    tmux(NULL, NULL, "select-pane", "-t", pane, "-T", label, NULL);
+#endif
     return tmux(NULL, NULL, "set-option", "-p", "-t", pane, "@nq_label", label, NULL) == 0 ? 0 : -1;
 }
 
@@ -173,6 +188,41 @@ int tmux_main_window_full(const char *window)
     return panes >= 1 + right;
 }
 
+#ifdef _WIN32
+/* psmux stores the session options of the session a client last attached
+ * to in the global options, so setting them would change every session on
+ * the server. The grid's options are put in place only around an attach,
+ * and the global values restored afterwards. */
+#define GRID_OPTS 3
+static const char *const grid_opt[GRID_OPTS] = {"key-table", "status-right", "status-right-length"};
+
+static void global_opts(char vals[GRID_OPTS][128])
+{
+    for (int i = 0; i < GRID_OPTS; i++) {
+        sb_t out = {0};
+        vals[i][0] = '\0';
+        if (tmux(&out, NULL, "show-options", "-g", "-v", grid_opt[i], NULL) == 0 && out.p)
+            snprintf(vals[i], sizeof vals[i], "%.*s", (int)strcspn(out.p, "\r\n"), out.p);
+        sb_free(&out);
+    }
+}
+
+static void restore_global_opts(char vals[GRID_OPTS][128])
+{
+    char now[GRID_OPTS][128];
+    global_opts(now);
+    for (int i = 0; i < GRID_OPTS; i++)
+        if (strcmp(now[i], vals[i])) tmux(NULL, NULL, "set-option", "-g", grid_opt[i], vals[i], NULL);
+}
+#endif
+
+static void grid_session_opts(const char *t)
+{
+    tmux(NULL, NULL, "set-option", "-t", t, "key-table", "nuq", NULL);
+    tmux(NULL, NULL, "set-option", "-t", t, "status-right", " F12 / Ctrl-q: back to nuq ", NULL);
+    tmux(NULL, NULL, "set-option", "-t", t, "status-right-length", "40", NULL);
+}
+
 void tmux_grid_keys(const char *session)
 {
     /* "=name:" is the exact-match form set-option accepts. */
@@ -180,9 +230,14 @@ void tmux_grid_keys(const char *session)
     snprintf(t, sizeof t, "=%s:", session);
     tmux(NULL, NULL, "bind-key", "-T", "nuq", "F12", "detach-client", NULL);
     tmux(NULL, NULL, "bind-key", "-T", "nuq", "C-q", "detach-client", NULL);
-    tmux(NULL, NULL, "set-option", "-t", t, "key-table", "nuq", NULL);
-    tmux(NULL, NULL, "set-option", "-t", t, "status-right", " F12 / Ctrl-q: back to nuq ", NULL);
-    tmux(NULL, NULL, "set-option", "-t", t, "status-right-length", "40", NULL);
+#ifdef _WIN32
+    char saved[GRID_OPTS][128];
+    global_opts(saved);
+    grid_session_opts(t);
+    restore_global_opts(saved);
+#else
+    grid_session_opts(t);
+#endif
 }
 
 int tmux_inside_session(const char *session)
@@ -194,7 +249,16 @@ int tmux_inside_session(const char *session)
     query(sock, sizeof sock, t, "#{socket_path}");
     /* $TMUX is "<socket path>,<pid>,<session index>". */
     size_t n = strcspn(env, ",");
+#ifdef _WIN32
+    /* psmux puts a made-up "/tmp/psmux-<pid>/<name>" in $TMUX, while
+     * #{socket_path} is "C:\Users\x\.psmux/<name>": only the server name
+     * (the -L name) is common to both. */
+    char envsock[1024];
+    snprintf(envsock, sizeof envsock, "%.*s", (int)n, env);
+    if (!sock[0] || _stricmp(nq_basename(sock), nq_basename(envsock))) return 0;
+#else
     if (!sock[0] || strlen(sock) != n || strncmp(sock, env, n)) return 0;
+#endif
     char name[128];
     query(name, sizeof name, pane, "#{session_name}");
     return !strcmp(name, session);
@@ -218,6 +282,42 @@ int tmux_takeover(const char *session, const char *pane)
     }
 
     fflush(stdout);
+#ifdef _WIN32
+    /* Attaching from inside another psmux is refused while TMUX or
+     * PSMUX_SESSION is set ("sessions should be nested with care"); nesting
+     * is what we want here. The child inherits our environment, so they
+     * are taken out of it for the duration. */
+    static const char *const nest[] = {"TMUX", "PSMUX_SESSION", "PSMUX_TARGET_SESSION"};
+    char *saved[3];
+    const char *sock = getenv("NUQ_TMUX_SOCKET");
+    const char *argv[7];
+    int k = 0;
+    argv[k++] = "tmux";
+    if (sock && *sock) {
+        argv[k++] = "-L";
+        argv[k++] = sock;
+    }
+    argv[k++] = "attach-session";
+    argv[k++] = "-t";
+    argv[k++] = t;
+    argv[k] = NULL;
+    for (int i = 0; i < 3; i++) {
+        const char *v = getenv(nest[i]);
+        saved[i] = v ? xstrdup(v) : NULL;
+        if (v) nq_unsetenv(nest[i]);
+    }
+    char st[130], gvals[GRID_OPTS][128];
+    snprintf(st, sizeof st, "=%s:", session);
+    global_opts(gvals);
+    grid_session_opts(st);
+    int rc = nq_spawn_wait(argv);
+    restore_global_opts(gvals);
+    for (int i = 0; i < 3; i++) {
+        if (!saved[i]) continue;
+        nq_setenv(nest[i], saved[i]);
+        free(saved[i]);
+    }
+#else
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
@@ -233,11 +333,13 @@ int tmux_takeover(const char *session, const char *pane)
     }
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+#endif
 
     if (zoomed) {
         char flag[8];
         query(flag, sizeof flag, pane, "#{window_zoomed_flag}");
         if (!strcmp(flag, "1")) tmux(NULL, NULL, "resize-pane", "-Z", "-t", pane, NULL);
     }
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    return rc;
 }

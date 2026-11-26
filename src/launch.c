@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 #include "adapters.h"
 #include "cli.h"
@@ -12,7 +14,9 @@
 #include "tmux.h"
 #include "util.h"
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 /* `nuq [-n NAME] [--sub a,b] <agent> [args...]`: start an agent in a new
  * pane of this directory's grid, creating the grid if this is the first. */
@@ -24,12 +28,19 @@ static char *write_env_file(const nq_ctx *c, const char *name)
 {
     sb_t path = {0};
     sb_addf(&path, "%s/env-%s", c->p.rundir, name);
-    int fd = open(path.p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path.p, O_WRONLY | O_CREAT | O_TRUNC | NQ_O_BINARY, 0600);
     if (fd < 0) die("cannot write %s", path.p);
+#ifdef _WIN32
+    for (char **e = nq_environ(); *e; e++) {
+        unsigned len = (unsigned)strlen(*e) + 1; /* entries are NUL-separated */
+        if (write(fd, *e, len) != (int)len) die("cannot write %s", path.p);
+    }
+#else
     for (char **e = environ; *e; e++) {
         size_t len = strlen(*e) + 1; /* entries are NUL-separated */
         if (write(fd, *e, len) != (ssize_t)len) die("cannot write %s", path.p);
     }
+#endif
     close(fd);
     return path.p;
 }
@@ -75,7 +86,7 @@ static void split_words(const char *s, av_t *out, av_t *owned)
 static void config_args(const char *kind, av_t *out, av_t *owned)
 {
     char path[PATH_MAX];
-    const char *base = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    const char *base = getenv("XDG_CONFIG_HOME"), *home = nq_home();
     if (base && *base)
         snprintf(path, sizeof path, "%s/nuq/config", base);
     else if (home && *home)
@@ -103,6 +114,22 @@ static void config_args(const char *kind, av_t *out, av_t *owned)
     free(line);
     fclose(f);
 }
+
+#ifdef _WIN32
+/* PowerShell single-quoted string: nothing inside is special except the
+ * quote itself, which is doubled. */
+static void add_psq(sb_t *sb, const char *s)
+{
+    sb_adds(sb, "'");
+    for (; *s; s++) {
+        if (*s == '\'')
+            sb_adds(sb, "''");
+        else
+            sb_add(sb, s, 1);
+    }
+    sb_adds(sb, "'");
+}
+#endif
 
 static void forget(const nq_ctx *c, const char *name)
 {
@@ -143,8 +170,19 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
     char err[512], agent_path[PATH_MAX], self[PATH_MAX];
     if (argc < 1) die("usage: nuq [-n NAME] [--sub TOPICS] <agent> [agent args...]");
 
+#ifdef _WIN32
+    /* "claude", "claude.exe", "C:/x/codex.cmd": the kind is the bare name. */
+    char kindbuf[64];
+    snprintf(kindbuf, sizeof kindbuf, "%s", nq_basename(argv[0]));
+    char *ext = strrchr(kindbuf, '.');
+    if (ext && (!_stricmp(ext, ".exe") || !_stricmp(ext, ".cmd") || !_stricmp(ext, ".bat") ||
+                !_stricmp(ext, ".com")))
+        *ext = '\0';
+    const char *kind = kindbuf;
+#else
     const char *kind = strrchr(argv[0], '/');
     kind = kind ? kind + 1 : argv[0];
+#endif
     if (find_on_path(argv[0], agent_path, sizeof agent_path) < 0)
         die("'%s' was not found on your PATH", argv[0]);
     if (tmux_check(err, sizeof err) < 0) die("%s", err);
@@ -190,7 +228,11 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
     if (!tmux_has_session(c->p.session)) {
         av_t a = {0};
         char cols[16], rows[16];
+#ifdef _WIN32
+        int tc = 0, tr = 0;
+#else
         struct winsize ws;
+#endif
         av_add(&a, "new-session");
         av_add(&a, "-d");
         av_add(&a, "-s");
@@ -200,9 +242,15 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
         av_add(&a, "-c");
         av_add(&a, c->p.dir);
         /* Size the detached session like the terminal that will attach. */
+#ifdef _WIN32
+        if (nq_term_size(&tc, &tr) == 0 && tc > 0 && tr > 0) {
+            snprintf(cols, sizeof cols, "%d", tc);
+            snprintf(rows, sizeof rows, "%d", tr);
+#else
         if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
             snprintf(cols, sizeof cols, "%d", ws.ws_col);
             snprintf(rows, sizeof rows, "%d", ws.ws_row);
+#endif
             av_add(&a, "-x");
             av_add(&a, cols);
             av_add(&a, "-y");
@@ -306,11 +354,22 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
         /* Keep the main agent at half the width when the terminal is
          * resized. A session hook, so other sessions are untouched. */
         sb_t hook = {0};
+#ifdef _WIN32
+        /* psmux's run-shell hands the command to PowerShell. psmux 3.4.0
+         * accepts this hook but never fires it; the broker re-lays out when
+         * the pane count changes, so only a terminal resize goes unnoticed. */
+        sb_adds(&hook, "run-shell -b \"& ");
+        add_psq(&hook, self);
+        sb_adds(&hook, " -C ");
+        add_psq(&hook, c->p.dir);
+        sb_adds(&hook, " _layout\"");
+#else
         sb_adds(&hook, "run-shell -b \"");
         sb_add_shq(&hook, self);
         sb_adds(&hook, " -C ");
         sb_add_shq(&hook, c->p.dir);
         sb_adds(&hook, " _layout\"");
+#endif
         tmux(NULL, NULL, "set-hook", "-t", target, "window-resized", hook.p, NULL);
         sb_free(&hook);
     }
@@ -318,8 +377,14 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
         /* Name each pane in its border. Set on the window, not globally, so
          * the user's other tmux sessions are untouched. */
         tmux(NULL, NULL, "set-option", "-w", "-t", pane, "pane-border-status", "top", NULL);
+#ifdef _WIN32
+        /* psmux expands no user options or conditionals here; tmux_set_label
+         * puts the label in the pane title instead. */
+        tmux(NULL, NULL, "set-option", "-w", "-t", pane, "pane-border-format", " #{pane_title} ", NULL);
+#else
         tmux(NULL, NULL, "set-option", "-w", "-t", pane, "pane-border-format",
              " #{?@nq_label,#{@nq_label},#{pane_title}} ", NULL);
+#endif
     }
     layout_now(c, fresh ? pane : NULL);
 

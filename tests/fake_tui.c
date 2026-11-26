@@ -9,14 +9,88 @@
  *   fake_tui --dialog   behaves like a permission dialog: pastes are
  *                       ignored and never shown; a bare Enter writes
  *                       "APPROVED" to the log. nuq must never cause that.
+ *
+ * On Windows the console is put in virtual-terminal input mode, which is
+ * what a raw terminal is there: keys and pastes arrive as VT bytes, Ctrl-C
+ * as 0x03, and nothing is echoed. Windows has no `ps` to read command lines
+ * from, so if $FAKE_ARGS_LOG is set the program appends its own (program
+ * path without .exe, then the arguments) to that file for the tests.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <termios.h>
 #include <unistd.h>
+#endif
 
+#ifdef _WIN32
+static HANDLE g_in, g_out;
+static DWORD g_in_mode, g_out_mode;
+static UINT g_in_cp, g_out_cp;
+
+static int raw_mode(void)
+{
+    g_in = GetStdHandle(STD_INPUT_HANDLE);
+    g_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!GetConsoleMode(g_in, &g_in_mode) || !GetConsoleMode(g_out, &g_out_mode)) return -1;
+    g_in_cp = GetConsoleCP();
+    g_out_cp = GetConsoleOutputCP();
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleMode(g_in, ENABLE_VIRTUAL_TERMINAL_INPUT);
+    SetConsoleMode(g_out, ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING |
+                              DISABLE_NEWLINE_AUTO_RETURN);
+    return 0;
+}
+
+static void restore(void)
+{
+    fputs("\033[?2004l", stdout);
+    fflush(stdout);
+    SetConsoleMode(g_in, g_in_mode);
+    SetConsoleMode(g_out, g_out_mode);
+    SetConsoleCP(g_in_cp);
+    SetConsoleOutputCP(g_out_cp);
+}
+
+static int read_byte(unsigned char *ch)
+{
+    DWORD n = 0;
+    return ReadFile(g_in, ch, 1, &n, NULL) && n == 1;
+}
+
+static void log_args(int argc, char **argv)
+{
+    const char *path = getenv("FAKE_ARGS_LOG");
+    char self[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof self);
+    if (!path || n == 0 || n >= sizeof self) return;
+    for (char *p = self; *p; p++)
+        if (*p == '\\') *p = '/';
+    if (n > 4 && !_stricmp(self + n - 4, ".exe")) self[n - 4] = '\0';
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    fputs(self, f);
+    for (int i = 1; i < argc; i++)
+        fprintf(f, " %s", argv[i]);
+    fputc('\n', f);
+    fclose(f);
+}
+#else
 static struct termios g_saved;
+
+static int raw_mode(void)
+{
+    struct termios raw;
+    if (tcgetattr(STDIN_FILENO, &g_saved) < 0) return -1;
+    raw = g_saved;
+    cfmakeraw(&raw);
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    return 0;
+}
 
 static void restore(void)
 {
@@ -25,9 +99,22 @@ static void restore(void)
     tcsetattr(STDIN_FILENO, TCSANOW, &g_saved);
 }
 
+static int read_byte(unsigned char *ch)
+{
+    return read(STDIN_FILENO, ch, 1) == 1;
+}
+
+static void log_args(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+}
+#endif
+
 static void record(const char *path, const char *text)
 {
-    FILE *f = fopen(path, "a");
+    /* Binary, so Windows writes the same bytes as POSIX. */
+    FILE *f = fopen(path, "ab");
     if (!f) return;
     fprintf(f, "%s\n", text);
     fclose(f);
@@ -42,11 +129,8 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    struct termios raw;
-    if (tcgetattr(STDIN_FILENO, &g_saved) < 0) return 2;
-    raw = g_saved;
-    cfmakeraw(&raw);
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    log_args(argc, argv);
+    if (raw_mode() < 0) return 2;
     atexit(restore);
     fputs("\033[?2004h", stdout);
     if (dialog)
@@ -64,7 +148,7 @@ int main(int argc, char **argv)
 
     for (;;) {
         unsigned char ch;
-        if (read(STDIN_FILENO, &ch, 1) != 1) break;
+        if (!read_byte(&ch)) break;
 
         /* Recognise the paste brackets; both start with ESC. */
         if (seqlen > 0 || ch == 0x1b) {

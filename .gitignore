@@ -1,6 +1,7 @@
 # Ignore everything by default. Allow the files used to build and test nuq.
 *
 !/.gitignore
+!/.gitattributes
 !/CMakeLists.txt
 !/CMakePresets.json
 
@@ -9,6 +10,7 @@
 !/src/
 !/src/*.c
 !/src/*.h
+!/src/*.manifest
 
 !/skills/
 !/skills/nuq/

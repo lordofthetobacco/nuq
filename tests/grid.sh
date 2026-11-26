@@ -64,10 +64,15 @@ waitfor 'check_main one' "one to stay the left half after a resize (got: $(geome
 "$NQ" kill three >/dev/null
 waitfor '[ "$(panes)" = 2 ]' "three's pane to close"
 
-step "the pane runs in the grid directory with the launcher's environment"
 p1=$(pane_of one)
 case "$p1" in %[0-9]*) ;; *) fail "could not find one's pane id, got '$p1'" ;; esac
-waitfor 'tm capture-pane -p -J -t "$p1" | grep -q "fake agent one ready in $(pwd -P)"' "agent banner"
+step "the pane runs in the grid directory with the launcher's environment"
+if [ -n "$NQ_WIN" ]; then
+    # psmux can crop the original banner when a split narrows the pane.
+    waitfor 'grep -Fxq "fake agent one ready in $(here)" "$FAKE_START_LOG"' "agent working directory"
+else
+    waitfor 'tm capture-pane -p -J -t "$p1" | grep -Fq "fake agent one ready in $(here)"' "agent banner"
+fi
 
 step "default arguments come from the config file, before the ones given"
 mkdir -p "$XDG_CONFIG_HOME/nuq"
@@ -77,7 +82,7 @@ fake_agent.sh.args = --from-config "two words" it\'s
 other.args = --not-this
 CONFIG
 "$NQ" --inject -n cfg "$FAKE_AGENT" --given </dev/null >/dev/null || fail "launching cfg"
-waitfor 'ps -ax -o args= | grep -q -- "fake_agent.sh --from-config two words it.s --given\$"' "the configured arguments"
+waitfor 'proc_args | grep -q -- "fake_agent.sh --from-config two words it.s --given\$"' "the configured arguments"
 "$NQ" kill cfg >/dev/null
 waitfor '[ "$(panes)" = 2 ]' "cfg's pane to close"
 rm "$XDG_CONFIG_HOME/nuq/config"
@@ -96,7 +101,13 @@ clients() {
 zoomed_flag() {
     tm display-message -p -t "$(pane_of ui)" '#{window_zoomed_flag}'
 }
-term new-session -d -s ui -x 120 -y 34 "env LANG=en_US.UTF-8 '$NQ' --inject -n ui '$FAKE_AGENT'; echo UI-EXITED; sleep 60"
+ui_cmd="env LANG=en_US.UTF-8 '$NQ' --inject -n ui '$FAKE_AGENT'; echo UI-EXITED; sleep 60"
+if [ -n "$NQ_WIN" ]; then
+    # psmux would hand a command string to a Windows shell.
+    term new-session -d -s ui -x 120 -y 34 -- "$(cygpath -m /)/bin/bash.exe" -c "$ui_cmd"
+else
+    term new-session -d -s ui -x 120 -y 34 "$ui_cmd"
+fi
 waitfor 'screen | grep -q "Message flow"' "the UI to open"
 [ "$(clients)" = 0 ] || fail "launching should not attach to tmux"
 
@@ -111,12 +122,21 @@ waitfor 'screen | grep -q ":send N|name|all text"' "help commands"
 term send-keys -t ui Escape
 waitfor 'screen | grep -q "two / fake_tui"' "selection to survive resize and help"
 term resize-window -t ui -x 120 -y 34
+# PDCurses (Windows) throws away keys typed while it handles a resize, so
+# type only once the wide layout is back.
+waitfor 'screen | grep "Message flow" | grep -q "Agents"' "the wide layout to return"
 
 step ":takeover shows the agent full screen; F12 and Ctrl-q come back"
 term send-keys -t ui ':takeover ui' Enter
 waitfor '[ "$(clients)" = 1 ]' "the takeover to attach"
 waitfor 'screen | grep -q "fake agent ui ready"' "the agent to fill the terminal"
-[ "$(zoomed_flag)" = 1 ] || fail "the taken-over pane should be zoomed"
+if [ -n "$NQ_WIN" ]; then
+    # Right around an attach psmux sometimes reports the zoom flag late
+    # (about one run in five); sampled again it is set throughout.
+    waitfor '[ "$(zoomed_flag)" = 1 ]' "the taken-over pane to be zoomed"
+else
+    [ "$(zoomed_flag)" = 1 ] || fail "the taken-over pane should be zoomed"
+fi
 screen | grep -q "back to nuq" || fail "tmux should show how to get back"
 term send-keys -t ui F12
 waitfor '[ "$(clients)" = 0 ]' "F12 to detach"
@@ -126,7 +146,13 @@ term send-keys -t ui ':t ui' Enter
 waitfor '[ "$(clients)" = 1 ]' "the second takeover"
 term send-keys -t ui C-q
 waitfor '[ "$(clients)" = 0 ]' "Ctrl-q to detach"
-[ "$(tm show-options -v -g key-table 2>/dev/null)" != nuq ] || fail "the global key table must not change"
+if [ -n "$NQ_WIN" ]; then
+    # psmux copies the attached session's options into the global ones;
+    # nuq puts the global values back once the attach has returned.
+    waitfor '[ "$(tm show-options -v -g key-table 2>/dev/null)" != nuq ]' "the global key table to be restored"
+else
+    [ "$(tm show-options -v -g key-table 2>/dev/null)" != nuq ] || fail "the global key table must not change"
+fi
 
 step ":q leaves the UI and the agents keep running"
 # The UI drops keys typed while it is coming back, so wait for it first.

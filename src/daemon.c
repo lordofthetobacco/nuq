@@ -3,16 +3,21 @@
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <poll.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include "bus.h"
 #include "inject.h"
@@ -45,10 +50,23 @@ typedef struct {
 
 static volatile sig_atomic_t g_signal;
 
+#ifdef _WIN32
+/* Windows has no SIGTERM or SIGHUP: `nuq down` is the way to stop the
+ * broker. This only covers a broker run by hand in a console. */
+static BOOL WINAPI on_console_event(DWORD ev)
+{
+    g_signal = (sig_atomic_t)(ev + 1);
+    /* For a closing console the process ends when this returns; give the
+     * main loop (which wakes at least once a second) time to wind down. */
+    if (ev == CTRL_CLOSE_EVENT || ev == CTRL_LOGOFF_EVENT || ev == CTRL_SHUTDOWN_EVENT) Sleep(2000);
+    return TRUE;
+}
+#else
 static void on_signal(int sig)
 {
     g_signal = sig;
 }
+#endif
 
 /* ---- replies and events ------------------------------------------------ */
 
@@ -59,7 +77,7 @@ static cJSON *reply_ok(void)
     return r;
 }
 
-__attribute__((format(printf, 1, 2))) static cJSON *reply_err(const char *fmt, ...)
+NQ_PRINTF(1, 2) static cJSON *reply_err(const char *fmt, ...)
 {
     char msg[512];
     va_list ap;
@@ -212,6 +230,26 @@ static cJSON *do_ls(daemon_t *d);
  * the deepest existing ancestor and appends the rest unchanged. */
 static void resolve_path(const char *path, char *out, size_t len)
 {
+#ifdef _WIN32
+    /* Hooks report "C:\x\y", "c:/x/y" or a mix; the stored form is
+     * "C:/x/y" in its on-disk case. The walk stops at the root ("C:/",
+     * "//server"). */
+    char norm[PATH_MAX], head[PATH_MAX], real[PATH_MAX];
+    snprintf(norm, sizeof norm, "%s", path);
+    nq_path_norm(norm);
+    snprintf(out, len, "%s", norm);
+    if (!nq_is_abs(norm)) return;
+    snprintf(head, sizeof head, "%s", norm);
+    for (;;) {
+        if (nq_realpath(head, real, sizeof real) == 0) {
+            snprintf(out, len, "%s%s", real, norm + strlen(head));
+            return;
+        }
+        char *slash = strrchr(head, '/');
+        if (!slash || slash - head < 3) return;
+        *slash = '\0';
+    }
+#else
     snprintf(out, len, "%s", path);
     if (path[0] != '/') return;
     char head[PATH_MAX], real[PATH_MAX];
@@ -225,6 +263,7 @@ static void resolve_path(const char *path, char *out, size_t len)
         if (!slash || slash == head) return;
         *slash = '\0';
     }
+#endif
 }
 
 /* What a hook reported the agent did: the tool it ran and the lines it
@@ -250,7 +289,13 @@ static void record_activity(daemon_t *d, nq_agent *a, const cJSON *q)
         resolve_path(file, real, sizeof real);
         file = real;
         size_t dl = strlen(d->p->dir);
+#ifdef _WIN32
+        /* Paths are case-insensitive; a file that does not exist yet keeps
+         * the case the hook gave it. */
+        if (!_strnicmp(file, d->p->dir, dl) && file[dl] == '/') file += dl + 1;
+#else
         if (!strncmp(file, d->p->dir, dl) && file[dl] == '/') file += dl + 1;
+#endif
         st_edit(&d->st, a->name, file, (uint64_t)added, (uint64_t)removed);
         cJSON *ev = cJSON_CreateObject();
         cJSON_AddStringToObject(ev, "t", "edit");
@@ -712,12 +757,16 @@ static void check_panes(daemon_t *d, uint64_t now)
 
 int daemon_alive(const nq_paths *p)
 {
+#ifdef _WIN32
+    return nq_lock_probe(p->lockfile);
+#else
     int fd = open(p->lockfile, O_RDONLY);
     if (fd < 0) return 0;
     int alive = flock(fd, LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK;
     if (!alive) flock(fd, LOCK_UN);
     close(fd);
     return alive;
+#endif
 }
 
 static int ping(const nq_paths *p, int timeout_ms)
@@ -738,6 +787,13 @@ int daemon_ensure(const nq_paths *p, char *err, size_t errlen)
         snprintf(err, errlen, "cannot locate the nuq executable");
         return -1;
     }
+#ifdef _WIN32
+    const char *argv[] = {self, "-C", p->dir, "daemon", NULL};
+    if (nq_spawn_detached(argv, p->logfile) < 0) {
+        snprintf(err, errlen, "cannot start the broker (%s)", self);
+        return -1;
+    }
+#else
     pid_t pid = fork();
     if (pid < 0) {
         snprintf(err, errlen, "fork: %s", strerror(errno));
@@ -762,6 +818,7 @@ int daemon_ensure(const nq_paths *p, char *err, size_t errlen)
     }
     int st;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+#endif
 
     for (int i = 0; i < 40; i++) {
         if (daemon_alive(p) && ping(p, 250)) return 0;
@@ -774,6 +831,25 @@ int daemon_ensure(const nq_paths *p, char *err, size_t errlen)
 int cmd_daemon(const nq_paths *p)
 {
     char err[512];
+#ifdef _WIN32
+    if (paths_mkdirs(p, err, sizeof err) < 0) die("%s", err);
+
+    int lockfd = -1;
+    /* Clients probe the lock briefly, so a failure may be momentary. */
+    for (int i = 0; i < 25 && lockfd < 0; i++) {
+        lockfd = nq_lock_acquire(p->lockfile);
+        if (lockfd < 0 && errno != EWOULDBLOCK) die("%s: %s", p->lockfile, strerror(errno));
+        if (lockfd < 0) sleep_ms(20);
+    }
+    if (lockfd < 0) {
+        nq_warn("a broker is already running for %s", p->dir);
+        return 0;
+    }
+    char pidtext[32];
+    snprintf(pidtext, sizeof pidtext, "%d\n", (int)getpid());
+    nq_lock_write(lockfd, pidtext); /* only a convenience for people */
+    SetConsoleCtrlHandler(on_console_event, TRUE);
+#else
     umask(077);
     if (paths_mkdirs(p, err, sizeof err) < 0) die("%s", err);
 
@@ -805,6 +881,7 @@ int cmd_daemon(const nq_paths *p)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     daemon_t d;
     memset(&d, 0, sizeof d);
@@ -814,15 +891,22 @@ int cmd_daemon(const nq_paths *p)
     int replayed = st_replay(&d.st, p->journal);
     if (replayed < 0) die("cannot read %s: %s", p->journal, strerror(errno));
     if (st_open_journal(&d.st, p->journal) < 0) die("cannot open %s: %s", p->journal, strerror(errno));
+#ifdef _WIN32
+    /* The tmux processes the broker starts must not hold the journal. */
+    SetHandleInformation((HANDLE)_get_osfhandle(_fileno(d.st.journal)), HANDLE_FLAG_INHERIT, 0);
+#else
     fcntl(fileno(d.st.journal), F_SETFD, FD_CLOEXEC);
+#endif
 
     /* All nanomsg use starts here, after any forking is over. */
     d.rep = bus_rep_bind(p->rpc_url);
     if (d.rep < 0) die("bind %s: %s", p->rpc_url, bus_error());
     d.pub = bus_pub_bind(p->ev_url);
     if (d.pub < 0) die("bind %s: %s", p->ev_url, bus_error());
+#ifndef _WIN32
     int rcvfd = bus_rcvfd(d.rep);
     if (rcvfd < 0) die("nanomsg gave no receive descriptor: %s", bus_error());
+#endif
 
     nq_log("broker %s up for %s (pid %d, %d journal records, %zu messages)", NQ_VERSION, p->dir,
            (int)getpid(), replayed, d.st.n_msgs);
@@ -838,8 +922,12 @@ int cmd_daemon(const nq_paths *p)
         if (d.st.agents[i]->live && d.st.agents[i]->pane) d.had_panes = 1;
 
     while (!d.stop && !g_signal) {
+#ifdef _WIN32
+        bus_wait(d.rep, in_flight(&d) ? 50 : 1000);
+#else
         struct pollfd pfd = {.fd = rcvfd, .events = POLLIN};
         poll(&pfd, 1, in_flight(&d) ? 50 : 1000);
+#endif
 
         for (;;) {
             char *req = bus_recv(d.rep, BUS_DONTWAIT, NULL);
@@ -882,6 +970,10 @@ int cmd_daemon(const nq_paths *p)
     bus_close(d.rep);
     bus_close(d.pub);
     st_free(&d.st);
+#ifdef _WIN32
+    nq_lock_release(lockfd);
+#else
     close(lockfd);
+#endif
     return 0;
 }
