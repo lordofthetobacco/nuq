@@ -1,7 +1,8 @@
 ---
 name: nuq
 description: >
-  Use nuq to run several coding agents (Claude Code, Codex, any CLI agent)
+  Use nuq to run several coding agents (Claude Code, Codex, Pi, Cursor's CLI,
+  Devin, any CLI agent)
   side by side in a tmux grid for the current directory and to exchange
   messages with them: direct messages, broadcasts, topics and a shared work
   queue. Use this skill whenever the user mentions nuq, a "grid" of agents,
@@ -81,6 +82,9 @@ codex-1   codex   busy     #7    1     %1    review
 nuq -d claude                           # becomes claude-1, claude-2, ...
 nuq -d -n reviewer claude               # choose the name
 nuq -d codex --sandbox workspace-write  # arguments after the agent go to the agent
+nuq -d pi                               # Pi; becomes pi-1
+nuq -d agent                            # Cursor's CLI; becomes cursor-1
+nuq -d devin                            # Devin; becomes devin-1
 nuq -d --sub review,build codex         # subscribe it to topics from the start
 ```
 

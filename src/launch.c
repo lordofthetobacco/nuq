@@ -183,6 +183,9 @@ int cmd_launch(nq_ctx *c, const nq_launch_opts *o, int argc, char **argv)
     const char *kind = strrchr(argv[0], '/');
     kind = kind ? kind + 1 : argv[0];
 #endif
+    /* Cursor's CLI is installed as `agent` (`cursor-agent` before that), a
+     * name that says nothing in a grid of agents. */
+    if (!strcmp(kind, "agent") || !strcmp(kind, "cursor-agent")) kind = "cursor";
     if (find_on_path(argv[0], agent_path, sizeof agent_path) < 0)
         die("'%s' was not found on your PATH", argv[0]);
     if (tmux_check(err, sizeof err) < 0) die("%s", err);

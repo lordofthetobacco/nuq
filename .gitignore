@@ -11,6 +11,7 @@
 !/src/*.c
 !/src/*.h
 !/src/*.manifest
+!/src/pi_extension.ts
 
 !/skills/
 !/skills/nuq/
@@ -26,6 +27,7 @@
 !/tests/*.c
 !/tests/*.h
 !/tests/*.sh
+!/tests/pi_host.mjs
 !/.github/
 !/.github/workflows/
 !/.github/workflows/ci.yml

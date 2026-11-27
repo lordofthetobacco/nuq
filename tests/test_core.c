@@ -117,6 +117,16 @@ static void test_edit_stats(void)
                         "*** Add File: src/b.c\\n+one\\n+two\\n*** End Patch\\n\"}}";
     edit_case(patch, "src/a.c", 2, 1);
     edit_case(patch, "src/b.c", 2, 0);
+    /* Pi: lower-case tools, "path", and a list of replacements. */
+    edit_case("{\"tool_name\":\"write\",\"tool_input\":{\"path\":\"n.txt\",\"content\":\"1\\n2\\n\"}}",
+              "n.txt", 2, 0);
+    edit_case("{\"tool_name\":\"edit\",\"tool_input\":{\"path\":\"src/e.c\",\"edits\":["
+              "{\"oldText\":\"x\",\"newText\":\"y\"},{\"oldText\":\"k\",\"newText\":\"k\\nl\"}]}}",
+              "src/e.c", 2, 1);
+    edit_case("{\"tool_name\":\"read\",\"tool_input\":{\"path\":\"src/e.c\"}}", NULL, 0, 0);
+    /* Devin: lower-case tools with Claude's field names. */
+    edit_case("{\"tool_name\":\"edit\",\"tool_input\":{\"file_path\":\"src/d.c\","
+              "\"old_string\":\"a\\nb\",\"new_string\":\"a\\nB\\nc\"}}", "src/d.c", 2, 1);
     edit_case("{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}", NULL, 0, 0);
 }
 

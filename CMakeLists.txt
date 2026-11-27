@@ -65,6 +65,18 @@ add_custom_command(
   COMMENT "Embedding skills/nuq/SKILL.md"
   VERBATIM)
 
+# So is the extension that connects Pi to the grid; nuq writes it out for
+# each run of Pi.
+set(NQ_PI_EXT_TS ${CMAKE_CURRENT_SOURCE_DIR}/src/pi_extension.ts)
+set(NQ_PI_EXT_C ${CMAKE_CURRENT_BINARY_DIR}/pi_extension_data.c)
+add_custom_command(
+  OUTPUT ${NQ_PI_EXT_C}
+  COMMAND ${CMAKE_COMMAND} -DINPUT=${NQ_PI_EXT_TS} -DOUTPUT=${NQ_PI_EXT_C} -DSYMBOL=nq_pi_extension
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake
+  DEPENDS ${NQ_PI_EXT_TS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake
+  COMMENT "Embedding src/pi_extension.ts"
+  VERBATIM)
+
 if(WIN32)
   set(NQ_COMPAT_C src/compat_win.c)
 else()
@@ -81,6 +93,7 @@ endif()
 
 add_library(nuq_core STATIC
   ${NQ_SKILL_C}
+  ${NQ_PI_EXT_C}
   ${NQ_COMPAT_C}
   src/util.c
   src/paths.c
