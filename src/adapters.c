@@ -13,9 +13,15 @@
 int adapter_mode(const char *kind, int inject)
 {
     if (!strcmp(kind, "claude")) return MODE_WAKE;
+    /* Pi's extension owns delivery, including the interval before its
+     * background waiter registers. A wake line could land in a draft. */
+    if (!strcmp(kind, "pi")) return MODE_PULL;
     /* Codex has hooks for state and mid-turn mail but no way to wake an idle
      * session, so idle delivery is a paste of the messages themselves. */
     if (!strcmp(kind, "codex")) return MODE_PASTE;
+    /* The same goes for Cursor's CLI and Devin. A paste also still arrives
+     * if their hooks never run, which leaves the state unknown. */
+    if (!strcmp(kind, "cursor") || !strcmp(kind, "devin")) return MODE_PASTE;
     return inject ? MODE_PASTE : MODE_PULL;
 }
 
@@ -93,39 +99,53 @@ static int add_self(sb_t *cmd, const char *self)
 #endif
 }
 
-/* ---- Claude Code ------------------------------------------------------- */
+/* The queue commands an agent may run without being asked each time. */
+static const char *const QUEUE_VERBS[] = {"send", "pub",  "sub",   "unsub", "push", "take", "done",
+                                          "fail", "inbox", "show", "ls",    "work", NULL};
 
-static cJSON *claude_command(const char *self, const char *event)
+/* obj[key] as an object or an array, created (or put right) if need be. */
+static cJSON *member(cJSON *obj, const char *key, int array)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (array ? cJSON_IsArray(it) : cJSON_IsObject(it)) return it;
+    if (it) cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+    return array ? cJSON_AddArrayToObject(obj, key) : cJSON_AddObjectToObject(obj, key);
+}
+
+/* ---- Claude Code (and Devin, which reads the same hook format) ---------- */
+
+static cJSON *claude_command(const char *self, const char *agent, const char *event)
 {
     sb_t cmd = {0};
     int powershell = add_self(&cmd, self);
-    sb_addf(&cmd, " hook claude %s", event);
+    sb_addf(&cmd, " hook %s %s", agent, event);
     cJSON *h = cJSON_CreateObject();
     cJSON_AddStringToObject(h, "type", "command");
     cJSON_AddStringToObject(h, "command", cmd.p);
-    if (powershell) cJSON_AddStringToObject(h, "shell", "powershell");
+    if (powershell && !strcmp(agent, "claude")) cJSON_AddStringToObject(h, "shell", "powershell");
     sb_free(&cmd);
     return h;
 }
 
-/* with_waiter: the agent may be idle after this event, so also start the
+/* Adds a hook for `event` after any that are already in `hooks`.
+ * with_waiter: the agent may be idle after this event, so also start the
  * background hook that wakes it when mail arrives (see hook.c). */
-static void claude_hook(cJSON *hooks, const char *self, const char *event, const char *matcher,
-                        int with_waiter)
+static void claude_hook(cJSON *hooks, const char *self, const char *agent, const char *event,
+                        const char *matcher, int with_waiter)
 {
     cJSON *group = cJSON_CreateObject();
     if (matcher) cJSON_AddStringToObject(group, "matcher", matcher);
     cJSON *list = cJSON_AddArrayToObject(group, "hooks");
 
-    cJSON *h = claude_command(self, event);
+    cJSON *h = claude_command(self, agent, event);
     cJSON_AddNumberToObject(h, "timeout", 10);
     cJSON_AddItemToArray(list, h);
     if (with_waiter) {
-        cJSON *w = claude_command(self, "Wait");
+        cJSON *w = claude_command(self, agent, "Wait");
         cJSON_AddBoolToObject(w, "asyncRewake", 1);
         cJSON_AddItemToArray(list, w);
     }
-    cJSON_AddItemToArray(cJSON_AddArrayToObject(hooks, event), group);
+    cJSON_AddItemToArray(member(hooks, event, 1), group);
 }
 
 /* Writes <rundir>/claude-<name>.json and returns its path. */
@@ -133,23 +153,21 @@ static char *claude_settings(const nq_ctx *c, const char *name, const char *self
 {
     cJSON *root = cJSON_CreateObject();
     cJSON *hooks = cJSON_AddObjectToObject(root, "hooks");
-    claude_hook(hooks, self, "SessionStart", NULL, 1);
-    claude_hook(hooks, self, "UserPromptSubmit", NULL, 0);
-    claude_hook(hooks, self, "PostToolUse", "*", 0);
-    claude_hook(hooks, self, "Stop", NULL, 1);
-    claude_hook(hooks, self, "Notification", NULL, 0);
+    claude_hook(hooks, self, "claude", "SessionStart", NULL, 1);
+    claude_hook(hooks, self, "claude", "UserPromptSubmit", NULL, 0);
+    claude_hook(hooks, self, "claude", "PostToolUse", "*", 0);
+    claude_hook(hooks, self, "claude", "Stop", NULL, 1);
+    claude_hook(hooks, self, "claude", "Notification", NULL, 0);
 
     /* Let the agent use the queue without a permission prompt each time. */
-    static const char *const verbs[] = {"send", "pub",  "sub",   "unsub", "push", "take", "done",
-                                        "fail", "inbox", "show", "ls",    "work", NULL};
     cJSON *allow = cJSON_AddArrayToObject(cJSON_AddObjectToObject(root, "permissions"), "allow");
-    for (int i = 0; verbs[i]; i++) {
+    for (int i = 0; QUEUE_VERBS[i]; i++) {
         char rule[64];
-        snprintf(rule, sizeof rule, "Bash(nuq %s:*)", verbs[i]);
+        snprintf(rule, sizeof rule, "Bash(nuq %s:*)", QUEUE_VERBS[i]);
         cJSON_AddItemToArray(allow, cJSON_CreateString(rule));
 #ifdef _WIN32
         /* Claude Code on Windows also has a PowerShell tool. */
-        snprintf(rule, sizeof rule, "PowerShell(nuq %s:*)", verbs[i]);
+        snprintf(rule, sizeof rule, "PowerShell(nuq %s:*)", QUEUE_VERBS[i]);
         cJSON_AddItemToArray(allow, cJSON_CreateString(rule));
 #endif
     }
@@ -265,6 +283,167 @@ static void codex_args(const char *self, av_t *av, av_t *owned)
     av_add(av, keep(owned, state.p));
 }
 
+/* ---- Devin ------------------------------------------------------------- */
+
+/* Blanks out // and block comments, which Devin allows in its config files. */
+static void strip_json_comments(char *s)
+{
+    int in_string = 0;
+    for (; *s; s++) {
+        if (in_string) {
+            if (*s == '\\' && s[1])
+                s++;
+            else if (*s == '"')
+                in_string = 0;
+        } else if (*s == '"') {
+            in_string = 1;
+        } else if (s[0] == '/' && s[1] == '/') {
+            while (*s && *s != '\n') *s++ = ' ';
+            if (!*s) break;
+        } else if (s[0] == '/' && s[1] == '*') {
+            char *end = strstr(s + 2, "*/");
+            end = end ? end + 2 : s + strlen(s);
+            while (s < end) *s++ = ' ';
+            s--;
+        }
+    }
+}
+
+/* The user's own Devin settings, or an empty object. */
+static cJSON *devin_user_config(void)
+{
+    sb_t path = {0};
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (base && *base) sb_addf(&path, "%s/devin/config.json", base);
+#else
+    const char *base = getenv("XDG_CONFIG_HOME"), *home = nq_home();
+    if (base && *base)
+        sb_addf(&path, "%s/devin/config.json", base);
+    else if (home && *home)
+        sb_addf(&path, "%s/.config/devin/config.json", home);
+#endif
+    cJSON *root = NULL;
+    int fd = path.p ? open(path.p, O_RDONLY | NQ_O_BINARY) : -1;
+    if (fd >= 0) {
+        char *text = read_fd_all(fd, 4 * 1024 * 1024, NULL);
+        close(fd);
+        if (text) strip_json_comments(text);
+        root = text ? cJSON_Parse(text) : NULL;
+        free(text);
+        if (!cJSON_IsObject(root)) {
+            nq_warn("%s is not readable as JSON; Devin starts without your settings from it\n", path.p);
+            cJSON_Delete(root);
+            root = NULL;
+        }
+    }
+    sb_free(&path);
+    return root ? root : cJSON_CreateObject();
+}
+
+/* Devin has no flag for hooks alone, only --config for the whole settings
+ * file. So this writes <rundir>/devin-<name>.json, a copy of the user's
+ * settings with nuq's hooks and permission rules added, and returns its
+ * path. ~/.config/devin is not touched. */
+static char *devin_config(const nq_ctx *c, const char *name, const char *self)
+{
+    static const char *const events[] = {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
+                                         "PermissionRequest"};
+    cJSON *root = devin_user_config();
+    cJSON *hooks = member(root, "hooks", 0);
+    for (size_t i = 0; i < sizeof events / sizeof events[0]; i++)
+        claude_hook(hooks, self, "devin", events[i], NULL, 0);
+
+    /* A rule is a command prefix, matched by whole words. */
+    cJSON *allow = member(member(root, "permissions", 0), "allow", 1);
+    for (int i = 0; QUEUE_VERBS[i]; i++) {
+        char rule[64];
+        snprintf(rule, sizeof rule, "Exec(nuq %s)", QUEUE_VERBS[i]);
+        cJSON_AddItemToArray(allow, cJSON_CreateString(rule));
+    }
+
+    sb_t path = {0};
+    sb_addf(&path, "%s/devin-%s.json", c->p.rundir, name);
+    char *text = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (write_private(path.p, text) < 0) die("cannot write %s", path.p);
+    free(text);
+    return path.p;
+}
+
+/* ---- Cursor ------------------------------------------------------------ */
+
+/* Cursor's CLI runs the hooks of a plugin, and --plugin-dir names a plugin
+ * directory for one run. Writes that plugin to <rundir>/cursor-<name>/ and
+ * returns the directory. ~/.cursor is not touched.
+ *
+ * Cursor has its own event names and replies (see cursor_event() in
+ * hook.c). There is no event for a permission prompt. */
+static char *cursor_plugin(const nq_ctx *c, const char *name, const char *self)
+{
+    static const char *const events[] = {"sessionStart", "beforeSubmitPrompt", "postToolUse",
+                                         "afterFileEdit", "stop"};
+    sb_t dir = {0}, sub = {0}, file = {0};
+    sb_addf(&dir, "%s/cursor-%s", c->p.rundir, name);
+    sb_addf(&sub, "%s/.cursor-plugin", dir.p);
+    if (mkdir_p(sub.p, 0700) < 0) die("cannot create %s", sub.p);
+    sb_addf(&file, "%s/plugin.json", sub.p);
+    if (write_private(file.p, "{\n  \"name\": \"nuq\",\n  \"description\": \"Connects this session to "
+                              "the nuq grid it was started in.\"\n}\n") < 0)
+        die("cannot write %s", file.p);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "version", 1);
+    cJSON *hooks = cJSON_AddObjectToObject(root, "hooks");
+    for (size_t i = 0; i < sizeof events / sizeof events[0]; i++) {
+        sb_t cmd = {0};
+        add_self(&cmd, self);
+        sb_addf(&cmd, " hook cursor %s", events[i]);
+        cJSON *h = cJSON_CreateObject();
+        cJSON_AddStringToObject(h, "command", cmd.p);
+        cJSON_AddNumberToObject(h, "timeout", 10);
+        /* Cursor stops following up after five rounds by default; mail is
+         * not a loop, so there is no limit. */
+        if (!strcmp(events[i], "stop")) cJSON_AddNullToObject(h, "loop_limit");
+        cJSON_AddItemToArray(cJSON_AddArrayToObject(hooks, events[i]), h);
+        sb_free(&cmd);
+    }
+    sb_free(&sub);
+    sb_free(&file);
+    sb_addf(&sub, "%s/hooks", dir.p);
+    if (mkdir_p(sub.p, 0700) < 0) die("cannot create %s", sub.p);
+    sb_addf(&file, "%s/hooks.json", sub.p);
+    char *text = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (write_private(file.p, text) < 0) die("cannot write %s", file.p);
+    free(text);
+    sb_free(&sub);
+    sb_free(&file);
+    return dir.p;
+}
+
+/* ---- Pi ---------------------------------------------------------------- */
+
+/* src/pi_extension.ts, compiled in (see cmake/EmbedFile.cmake). */
+extern const unsigned char nq_pi_extension[];
+
+/* Writes <rundir>/pi-<name>.ts and returns its path: the extension behind a
+ * line that tells it where nuq is. Pi loads it with -e for this run only;
+ * ~/.pi is not touched. */
+static char *pi_extension(const nq_ctx *c, const char *name, const char *self)
+{
+    char *quoted = json_quote(self);
+    sb_t text = {0};
+    sb_addf(&text, "const NUQ = %s;\n%s", quoted, (const char *)nq_pi_extension);
+    free(quoted);
+
+    sb_t path = {0};
+    sb_addf(&path, "%s/pi-%s.ts", c->p.rundir, name);
+    if (write_private(path.p, text.p) < 0) die("cannot write %s", path.p);
+    sb_free(&text);
+    return path.p;
+}
+
 /* ---- dispatch ---------------------------------------------------------- */
 
 void adapter_command(const nq_ctx *c, const char *kind, const char *name, const char *self,
@@ -276,6 +455,15 @@ void adapter_command(const nq_ctx *c, const char *kind, const char *name, const 
         av_add(av, keep(owned, claude_settings(c, name, self)));
     } else if (!strcmp(kind, "codex")) {
         codex_args(self, av, owned);
+    } else if (!strcmp(kind, "pi")) {
+        av_add(av, "-e");
+        av_add(av, keep(owned, pi_extension(c, name, self)));
+    } else if (!strcmp(kind, "cursor")) {
+        av_add(av, "--plugin-dir");
+        av_add(av, keep(owned, cursor_plugin(c, name, self)));
+    } else if (!strcmp(kind, "devin")) {
+        av_add(av, "--config");
+        av_add(av, keep(owned, devin_config(c, name, self)));
     }
     for (int i = 0; i < argc; i++) av_add(av, argv[i]);
 }

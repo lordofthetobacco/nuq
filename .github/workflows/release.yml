@@ -31,6 +31,9 @@ on:
       - CMakeLists.txt
       - CMakePresets.json
       - cmake/**
+      - src/**
+      - third_party/**
+      - skills/**
 
 permissions:
   contents: read
@@ -176,6 +179,7 @@ jobs:
           tar -tzf "$NAME.tar.gz"
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $reported = & "$env:BUILD/nuq.exe" version
@@ -187,6 +191,23 @@ jobs:
           Copy-Item "$env:BUILD/_deps/nng-src/LICENSE.txt" "stage/$env:NAME/LICENSES/NNG.txt"
           Compress-Archive -Path "stage/$env:NAME" -DestinationPath "$env:NAME.zip"
           Get-ChildItem -Recurse -File "stage/$env:NAME" | ForEach-Object FullName
+
+      - name: Smoke test the Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = Join-Path $env:RUNNER_TEMP 'nuq release smoke test'
+          Expand-Archive -Path "$env:NAME.zip" -DestinationPath $destination
+          $nuq = Join-Path $destination "$env:NAME/bin/nuq.exe"
+          $reported = & $nuq version
+          if ($LASTEXITCODE -ne 0 -or $reported -ne "nuq $env:VERSION") {
+              throw "Packaged nuq reports '$reported', expected 'nuq $env:VERSION'"
+          }
+          $skill = (& $nuq skills show) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $skill -notmatch '(?m)^name: nuq$') {
+              throw 'The packaged nuq skill could not be loaded'
+          }
 
       - uses: actions/upload-artifact@v7
         with:

@@ -108,27 +108,30 @@ if [ -n "$NQ_WIN" ]; then
 else
     term new-session -d -s ui -x 120 -y 34 "$ui_cmd"
 fi
-waitfor 'screen | grep -q "Agent terminal"' "the UI to open"
+waitfor 'screen | grep -Fq "[Agents"' "the UI to open"
 [ "$(clients)" = 0 ] || fail "launching should not attach to tmux"
 
-step "the roster, narrow layout, and help stay usable"
-waitfor 'screen | grep -q "Agent terminal / one"' "the first agent's details"
+step "the roster fills the width and stays usable when narrow and behind help"
+waitfor 'screen | grep -q ">1. one"' "the first agent's tile to be selected"
 screen | grep -q "fake_agent.sh" || fail "the tile should show the agent's kind"
-term send-keys -t ui Down
-waitfor 'screen | grep -q "Agent terminal / two"' "selection to update the details"
+hasnt "$(screen)" "Agent terminal" "the dashboard (no agent terminal pane)"
+# Three tiles on one row, centred: the last one reaches the right half.
+screen | grep -Eq "^.{70,}[ >]3. ui" || fail "the tiles should use the whole width"
+term send-keys -t ui Right
+waitfor 'screen | grep -q ">2. two"' "Right to select the next agent"
 term resize-window -t ui -x 58 -y 22
-waitfor 'screen | grep "Agent terminal" | grep -qv "Agents"' "agent terminal in the stacked layout"
+waitfor 'screen | grep -q "[ >]3. ui" && ! screen | grep -Eq "^.{70,}[ >]3. ui"' "the tiles to fit the narrow window"
+waitfor 'screen | grep -q ">2. two"' "the selection to survive a resize"
 term send-keys -t ui F1
 waitfor 'screen | grep -q ":send N|name|all text"' "help commands"
 term send-keys -t ui Escape
-waitfor 'screen | grep -q "Agent terminal / two"' "selection to survive resize and help"
+waitfor 'screen | grep -q ">2. two"' "the selection to survive help"
 term resize-window -t ui -x 120 -y 34
 # PDCurses (Windows) throws away keys typed while it handles a resize, so
 # type only once the wide layout is back.
-waitfor 'screen | grep "Agent terminal" | grep -q "Agents"' "the wide layout to return"
+waitfor 'screen | grep -Eq "^.{70,}[ >]3. ui"' "the wide layout to return"
 
-step "the agent tile is display only: typing never reaches the agent"
-waitfor 'screen | grep -q "fake tui ready"' "the selected agent's live output"
+step "keys typed in the roster never reach an agent, wherever the selection is"
 term send-keys -t ui -l -- 'xyzzy'
 if [ -z "$NQ_WIN" ]; then
     # Dropping a paste needs bracketed paste. PDCurses (Windows) has none:
@@ -136,25 +139,68 @@ if [ -z "$NQ_WIN" ]; then
     printf 'pasted line' | term load-buffer -
     term paste-buffer -p -d -t ui
 fi
+# Past the last tile there is no pane to walk into.
+term send-keys -t ui Right Right Right
+waitfor 'screen | grep -q ">3. ui"' "Right to stop at the last agent"
+term send-keys -t ui -l -- 'bump'
 sleep 1
-hasnt "$(screen)" "xyzzy" "the agent tile (typed text)"
-hasnt "$(screen)" "pasted line" "the agent tile (pasted text)"
-hasnt "$(cat "$FAKE_AGENT_LOG" 2>/dev/null)" "xyzzy" "the agent input"
+screen | grep -Fq "[Agents" || fail "the roster should keep the focus"
+hasnt "$(screen)" "xyzzy" "the dashboard (typed text)"
+hasnt "$(screen)" "pasted line" "the dashboard (pasted text)"
+log=$(cat "$FAKE_AGENT_LOG" 2>/dev/null)
+hasnt "$log" "xyzzy" "the agent input"
+hasnt "$log" "bump" "the agent input"
+hasnt "$log" "pasted line" "the agent input"
 [ "$(clients)" = 0 ] || fail "typing should keep the dashboard open"
 
-step "the bottom panel switches to a shell in the project directory"
+step "Tab focuses a shell in the project directory; ':' stays the command prompt"
 term send-keys -t ui Tab
-waitfor 'screen | grep -q "i type"' "the terminal tab"
-term send-keys -t ui i
-waitfor 'screen | grep -q "Terminal (typing)"' "typing mode"
-term send-keys -t ui -l -- 'echo shell-$((6*7))'
+waitfor 'screen | grep -Fq "[Terminal]"' "the terminal tab to take the focus"
+# No 'i' first: the focused terminal is typed into. '::' is a literal colon.
+term send-keys -t ui -l -- 'echo shell-$((6*7))::ok'
 term send-keys -t ui Enter
-waitfor 'screen | grep -q "shell-42"' "the shell to run the command"
-term send-keys -t ui F12
-waitfor 'screen | grep -q "i type"' "F12 to stop typing"
+waitfor 'screen | grep -q "shell-42:ok"' "the shell to run the command"
 hasnt "$(cat "$FAKE_AGENT_LOG" 2>/dev/null)" "shell-" "the agent input"
+if [ -z "$NQ_WIN" ]; then
+    # A paste reaches the focused terminal whole, colons and all, and waits
+    # for Enter.
+    printf 'echo pasted:$((2*4))' | term load-buffer -
+    term paste-buffer -p -d -t ui
+    waitfor 'screen | grep -Fq "echo pasted:\$((2*4))"' "the paste to reach the shell"
+    hasnt "$(screen)" "pasted:8" "the shell (a paste must not submit itself)"
+    term send-keys -t ui Enter
+    waitfor 'screen | grep -q "pasted:8"' "Enter to run the pasted command"
+fi
+term send-keys -t ui ':files' Enter
+waitfor 'screen | grep -Fq "[Changed files"' ":files to show the changed files from the terminal"
 term send-keys -t ui Tab
-waitfor 'screen | grep -q "Tab terminal"' "the changed-files tab"
+waitfor 'screen | grep -Fq "[Terminal]"' "Tab to go back to the terminal"
+term send-keys -t ui F12
+waitfor 'screen | grep -q "Tab type here"' "F12 to leave the terminal"
+screen | grep -Fq "[Agents" || fail "F12 should give the focus back to the roster"
+
+step "the shell takes keys only once it is focused on purpose"
+# Plain arrows walk off the roster into the changed files, never into the
+# shell: Down from the only row stays put, and what follows is not typed.
+term send-keys -t ui Down
+term send-keys -t ui -l -- 'bump-9'
+sleep 1
+screen | grep -Fq "[Agents" || fail "Down must not move the focus into the shell"
+hasnt "$(screen)" "bump-9" "the shell (typed while the roster had the focus)"
+if [ -z "$NQ_WIN" ]; then
+    term send-keys -t ui S-Down
+    waitfor 'screen | grep -Fq "[Terminal]"' "Shift+Down to focus the shell"
+    term send-keys -t ui S-Up
+    waitfor 'screen | grep -Fq "[Agents"' "Shift+Up to leave the shell"
+fi
+term send-keys -t ui ':files' Enter
+waitfor 'screen | grep -Fq "[Changed files"' ":files to focus the changed files"
+term send-keys -t ui Escape
+waitfor 'screen | grep -Fq "[Agents"' "Escape to leave the changed files"
+term send-keys -t ui Down
+waitfor 'screen | grep -Fq "[Changed files"' "Down to walk on to the changed files"
+term send-keys -t ui Up
+waitfor 'screen | grep -Fq "[Agents"' "Up to walk back to the roster"
 
 step ":takeover shows the agent full screen; F12 and Ctrl-q come back"
 term send-keys -t ui ':takeover ui' Enter
@@ -187,7 +233,7 @@ fi
 step ":q leaves the UI and the agents keep running"
 # The UI drops keys typed while it is coming back, so wait for it first.
 sleep 1
-waitfor 'screen | grep -q "Agent terminal"' "the UI to be back"
+waitfor 'screen | grep -Fq "[Agents"' "the UI to be back"
 term send-keys -t ui ':q' Enter
 waitfor 'screen | grep -q UI-EXITED' "the UI to exit"
 "$NQ" ls | grep -q "^ui " || fail "ui should still be running"

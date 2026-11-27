@@ -1,8 +1,11 @@
 # The Claude Code integration, without Claude: a fake full-screen program
 # named "claude" sits in the pane, and the test plays the part of Claude's
 # hook system by running `nuq hook claude <event>` with the JSON Claude
-# would send.
-. "$(dirname "$0")/lib.sh"
+# would send. Codex and Pi follow at the end, the same way.
+tests_dir=$(cd "$(dirname "$0")" && pwd)
+. "$tests_dir/lib.sh"
+# node is a native program on Windows and needs a C:/ path.
+[ -z "$NQ_WIN" ] || tests_dir=$(cygpath -m "$tests_dir")
 
 : "${FAKE_TUI:?}"
 if ! command -v tmux >/dev/null 2>&1; then
@@ -139,7 +142,7 @@ tmux -L "$NUQ_TMUX_SOCKET" new-window -d -n dash -- "$@"
 # psmux reads a bare target as a session name; ":dash" is the window.
 dash=dash
 [ -z "$NQ_WIN" ] || dash=:dash
-waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$dash" | grep -q "Agent terminal"' "the dashboard to draw"
+waitfor 'tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$dash" | grep -Fq "[Agents"' "the dashboard to draw"
 screen=$(tmux -L "$NUQ_TMUX_SOCKET" capture-pane -p -t "$dash")
 has "$screen" "claude-1" "the dashboard screen"
 has "$screen" "Changed files" "the dashboard screen"
@@ -245,5 +248,184 @@ as dana "$NQ" send @codex-1 -- not into the dialog >/dev/null
 sleep 1.5
 hasnt "$(cat "$FAKE_AGENT_LOG")" "not into the dialog" "what was typed into codex"
 has "$(codex_hook PostToolUse '{}')" "not into the dialog"
+
+step "pi is started with nuq's extension for this run only"
+cp "$FAKE_TUI" "$T/bin/pi$EXE"
+"$NQ" pi </dev/null >/dev/null || fail "launching pi"
+waitfor '"$NQ" ls | grep "^pi-1" | grep -q "%"' "pi-1 to register"
+ext=$(find "$T/run" -name 'pi-pi-1.ts')
+[ -n "$ext" ] || fail "no generated extension file"
+waitfor 'proc_args | grep -Fq -- "$T/bin/pi -e $ext"' "pi to start with -e"
+head -1 "$ext" | grep -q '^const NUQ = ".*nuq.*";$' || fail "the extension does not know where nuq is"
+grep -q '"hook", "pi", event' "$ext" || fail "the extension does not call nuq hook"
+
+pi_hook() {
+    printf '%s' "${2:-{\}}" | as pi-1 "$NQ" hook pi "$1"
+}
+
+step "pi's hooks introduce the grid and count its edits"
+has "$(pi_hook SessionStart)" "Your name in the grid is pi-1"
+[ "$(state_of pi-1)" = idle ] || fail "expected pi-1 idle after SessionStart"
+pi_hook PostToolUse '{"tool_name":"edit","tool_input":{"path":"src/p.c","edits":[{"oldText":"a","newText":"b\nc"}]}}' >/dev/null
+out=$("$NQ" dash --once)
+has "$out" "doing: edit" "the dashboard"
+has "$out" "src/p.c  (pi-1)" "the dashboard"
+
+if command -v node >/dev/null 2>&1; then
+    # The extension itself, with node playing Pi (tests/pi_host.mjs).
+    cp "$ext" "$T/pi_ext.mjs"
+    pi_host() {
+        NQ="$NQ" as pi-1 node "$tests_dir/pi_host.mjs" "$T/pi_ext.mjs" "$@"
+    }
+
+    step "the extension wakes an idle pi itself; nothing is typed into its pane"
+    : >"$FAKE_AGENT_LOG"
+    out=$(pi_host session_start 'send:wake up pi' wait_message before_agent_start)
+    has "$out" 'sendMessage triggerTurn=true deliverAs=steer "nuq messages arrived:' "the extension"
+    has "$out" "wake up pi" "the extension"
+    has "$out" 'intro="You are running inside nuq' "the extension (system prompt section)"
+    has "$out" "message=null" "the extension"
+    hasnt "$(cat "$FAKE_AGENT_LOG")" "pi-1" "what was typed into pi"
+    [ "$(state_of pi-1)" = busy ] || fail "expected pi-1 busy during a run"
+
+    step "mail waiting at a prompt joins the run; during the run it is steered in"
+    as dana "$NQ" send @pi-1 -- before the prompt >/dev/null
+    out=$(pi_host before_agent_start 'send:mid-turn mail' \
+        'tool_result:{"toolName":"write","input":{"path":"pi.txt","content":"1\n2\n"},"isError":false}' \
+        'send:lost edit' \
+        'tool_result:{"toolName":"edit","input":{"path":"no.txt","edits":[{"oldText":"a","newText":"b"}]},"isError":true}')
+    has "$out" 'message="New nuq messages:' "the extension"
+    has "$out" "before the prompt" "the extension"
+    has "$out" 'sendMessage triggerTurn=true deliverAs=steer "New nuq messages:' "the extension"
+    has "$out" "mid-turn mail" "the extension"
+    has "$out" "lost edit" "the extension"
+    out=$("$NQ" dash --once)
+    has "$out" "pi.txt  (pi-1)" "the dashboard"
+    hasnt "$out" "no.txt" "the dashboard (a failed edit changed nothing)"
+
+    step "mail at the end of a run starts another; otherwise pi goes idle"
+    out=$(pi_host before_agent_start 'send:end of run mail' agent_settled)
+    has "$out" 'sendMessage triggerTurn=true deliverAs=steer "nuq messages arrived while you were working:' "the extension"
+    has "$out" "end of run mail" "the extension"
+    [ "$(state_of pi-1)" = busy ] || fail "expected pi-1 busy with the mail it was handed"
+    out=$(pi_host before_agent_start agent_settled)
+    hasnt "$out" "sendMessage" "the extension"
+    [ "$(state_of pi-1)" = idle ] || fail "expected pi-1 idle after a run with no mail"
+
+    step "an extension dialog marks pi blocked until it is answered"
+    pi_host before_agent_start ui_prompt_start >/dev/null
+    [ "$(state_of pi-1)" = blocked ] || fail "expected pi-1 blocked"
+    pi_host before_agent_start ui_prompt_start ui_prompt_end >/dev/null
+    [ "$(state_of pi-1)" = busy ] || fail "expected pi-1 busy after the dialog"
+fi
+
+step "cursor's CLI gets its hooks as a plugin for this run only"
+# Cursor's CLI is installed as "agent"; in the grid it is called cursor.
+cp "$FAKE_TUI" "$T/bin/agent$EXE"
+: >"$FAKE_AGENT_LOG"
+"$NQ" agent </dev/null >/dev/null || fail "launching cursor's agent"
+waitfor '"$NQ" ls | grep "^cursor-1" | grep -q "%"' "cursor-1 to register"
+plugin=$(find "$T/run" -type d -name 'cursor-cursor-1')
+[ -n "$plugin" ] || fail "no generated plugin directory"
+waitfor 'proc_args | grep -Fq -- "$T/bin/agent --plugin-dir $plugin"' "cursor to start with --plugin-dir"
+grep -q '"name": "nuq"' "$plugin/.cursor-plugin/plugin.json" || fail "the plugin has no manifest"
+for ev in sessionStart beforeSubmitPrompt postToolUse afterFileEdit stop; do
+    grep -q "hook cursor $ev" "$plugin/hooks/hooks.json" || fail "the plugin lacks a $ev hook"
+done
+grep -q 'loop_limit.*null' "$plugin/hooks/hooks.json" || fail "follow-ups should not be limited"
+
+cursor_hook() {
+    printf '%s' "${2:-{\}}" | as cursor-1 "$NQ" hook cursor "$1"
+}
+
+step "cursor's hooks answer in cursor's own format"
+out=$(cursor_hook sessionStart '{"session_id":"s1"}')
+has "$out" '"additional_context":"You are running inside nuq'
+has "$out" "Your name in the grid is cursor-1"
+[ "$(state_of cursor-1)" = idle ] || fail "expected cursor-1 idle after sessionStart"
+
+step "an idle cursor gets mail by paste"
+as dana "$NQ" send @cursor-1 -- pasted to cursor >/dev/null
+waitfor 'grep -q "pasted to cursor" "$FAKE_AGENT_LOG"' "the paste into cursor"
+waitfor '[ "$(state_of cursor-1)" = busy ]' "cursor-1 to be marked busy after the paste"
+
+step "while cursor works, mail comes with a tool result or as a follow-up"
+[ -z "$(cursor_hook beforeSubmitPrompt '{"prompt":"go"}')" ] || fail "beforeSubmitPrompt should print nothing"
+as dana "$NQ" send @cursor-1 -- with the tool result >/dev/null
+sleep 1.5
+hasnt "$(cat "$FAKE_AGENT_LOG")" "with the tool result" "what was typed into cursor"
+out=$(cursor_hook postToolUse '{"tool_name":"Shell","tool_input":{"command":"ls"}}')
+has "$out" '"additional_context":"New nuq messages:'
+has "$out" "with the tool result"
+cursor_hook afterFileEdit "{\"file_path\":\"$PROJ/src/c.c\",\"edits\":[{\"old_string\":\"a\",\"new_string\":\"b\\nc\"}]}" >/dev/null
+out=$("$NQ" dash --once)
+has "$out" "doing: Shell" "the dashboard"
+has "$out" "src/c.c  (cursor-1)" "the dashboard"
+as dana "$NQ" send @cursor-1 -- at the end of the turn >/dev/null
+out=$(cursor_hook stop '{"status":"completed","loop_count":0}')
+has "$out" '"followup_message":"nuq messages arrived while you were working:'
+has "$out" "at the end of the turn"
+[ "$(state_of cursor-1)" = busy ] || fail "expected cursor-1 busy with the follow-up"
+[ -z "$(cursor_hook stop '{"status":"completed","loop_count":1}')" ] || fail "stop with an empty inbox should print nothing"
+[ "$(state_of cursor-1)" = idle ] || fail "expected cursor-1 idle after stop"
+
+step "an interrupted cursor turn takes no follow-up; the mail is pasted instead"
+cursor_hook beforeSubmitPrompt >/dev/null
+as dana "$NQ" send @cursor-1 -- after the interrupt >/dev/null
+[ -z "$(cursor_hook stop '{"status":"aborted","loop_count":0}')" ] || fail "an aborted stop should print nothing"
+waitfor 'grep -q "after the interrupt" "$FAKE_AGENT_LOG"' "the paste after an interrupt"
+
+step "devin gets a copy of its settings with nuq's hooks, for this run only"
+cp "$FAKE_TUI" "$T/bin/devin$EXE"
+devin_dir="$XDG_CONFIG_HOME/devin"
+if [ -n "$NQ_WIN" ]; then
+    export APPDATA="$T/appdata"
+    devin_dir="$APPDATA/devin"
+fi
+mkdir -p "$devin_dir"
+cat >"$devin_dir/config.json" <<'CONFIG'
+{
+  // the user's own settings, with the comments Devin allows
+  "agent": { "model": "their-model" }, /* kept */
+  "permissions": { "allow": ["Exec(git)"] },
+  "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "echo // theirs" }] }] }
+}
+CONFIG
+"$NQ" devin </dev/null >/dev/null || fail "launching devin"
+waitfor '"$NQ" ls | grep "^devin-1" | grep -q "%"' "devin-1 to register"
+cfg=$(find "$T/run" -name 'devin-devin-1.json')
+[ -n "$cfg" ] || fail "no generated config file"
+waitfor 'proc_args | grep -Fq -- "$T/bin/devin --config $cfg"' "devin to start with --config"
+for ev in SessionStart UserPromptSubmit PostToolUse Stop PermissionRequest; do
+    grep -q "hook devin $ev" "$cfg" || fail "the config lacks a $ev hook"
+done
+grep -q 'Exec(nuq send)' "$cfg" || fail "nuq send is not pre-approved"
+grep -q 'their-model' "$cfg" || fail "the user's settings were not carried over"
+grep -q 'Exec(git)' "$cfg" || fail "the user's permission rules were not carried over"
+grep -q 'echo // theirs' "$cfg" || fail "the user's own hooks were not carried over"
+if grep -q nuq "$devin_dir/config.json"; then
+    fail "the user's settings file was edited"
+fi
+
+devin_hook() {
+    printf '%s' "${2:-{\}}" | as devin-1 "$NQ" hook devin "$1"
+}
+
+step "devin's hooks speak claude's format"
+has "$(devin_hook SessionStart '{"source":"startup"}')" "Your name in the grid is devin-1"
+[ "$(state_of devin-1)" = idle ] || fail "expected devin-1 idle after SessionStart"
+devin_hook UserPromptSubmit '{"prompt":"go"}' >/dev/null
+devin_hook PermissionRequest '{"tool_name":"exec","tool_input":{"command":"make"}}'
+[ "$(state_of devin-1)" = blocked ] || fail "expected devin-1 blocked"
+as dana "$NQ" send @devin-1 -- hello devin >/dev/null
+out=$(devin_hook PostToolUse '{"tool_name":"edit","tool_input":{"file_path":"src/d.c","old_string":"a","new_string":"b"},"tool_response":{"success":true,"output":"","error":null}}')
+has "$out" '"additionalContext":"New nuq messages:'
+has "$out" "hello devin"
+devin_hook PostToolUse '{"tool_name":"edit","tool_input":{"file_path":"src/failed.c","old_string":"a","new_string":"b"},"tool_response":{"success":false,"output":"","error":"no match"}}' >/dev/null
+out=$("$NQ" dash --once)
+has "$out" "src/d.c  (devin-1)" "the dashboard"
+hasnt "$out" "src/failed.c" "the dashboard (a failed edit changed nothing)"
+[ -z "$(devin_hook Stop '{"stop_hook_active":false}')" ] || fail "Stop with an empty inbox should print nothing"
+[ "$(state_of devin-1)" = idle ] || fail "expected devin-1 idle after Stop"
 
 echo ok

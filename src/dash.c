@@ -1,8 +1,13 @@
 /* `nuq` with no arguments (or `nuq dash`): a live view of the grid.
  *
  *   header      directory, agents, work queue, git totals
- *   main        agent roster and selected agent terminal
- *   bottom      changed files: git's view next to what each agent edited
+ *   main        agent roster, the full width
+ *   bottom      changed files (git's view next to what each agent edited),
+ *               or a shell in the grid's directory
+ *
+ * One of the two panes has the focus and receives the keys. Shift+arrow
+ * moves the focus; ':' opens the command prompt from either pane. An agent's
+ * own terminal is shown by a takeover, never inside the dashboard.
  *
  * `nuq dash --once` prints the same information once as plain text. */
 #define _XOPEN_SOURCE 700  /* wcwidth */
@@ -29,9 +34,9 @@
 #include "tmux.h"
 #include "util.h"
 
-#define CHAT_REFRESH_MS 200
-#define CHAT_MIN_HEIGHT 10
-#define CHAT_MIN_WIDTH 32
+#define REFRESH_MS 200
+#define DASH_MIN_HEIGHT 10
+#define DASH_MIN_WIDTH 32
 #define FLASH_MS 1800
 #define EDGE_MAX 128
 
@@ -67,18 +72,22 @@ typedef struct {
 } screen_t;
 
 enum { TAB_FILES, TAB_TERM };
+/* The focusable panes. The shell forwards every key it gets to its tmux
+ * pane; the roster and the files list keep them. */
+enum { F_AGENTS, F_BOTTOM };
+enum { D_UP = 1, D_DOWN, D_LEFT, D_RIGHT };
 
 typedef struct {
     nq_ctx *c;
     cJSON *stats;      /* last `stats` reply, NULL when no broker answers */
     int sub, subfd;
-    screen_t chat;     /* selected agent's pane */
-    const char *own_pane;
-    int cursor_screen_x, cursor_screen_y;
-    uint64_t t_chat;
     /* Bottom panel: changed files, or a shell in the grid's directory that
      * runs in its own tmux session ("<grid>-sh"). */
-    int tab, term_focus;
+    int tab;
+    int focus;               /* focused pane */
+    int has_bottom;          /* the last frame had room for the bottom panel */
+    int grid_cols;           /* tiles per roster row in the last frame */
+    int files_top, files_shown;
     screen_t term;
     char term_pane[48];
     int term_w, term_h;      /* size the shell pane was last given */
@@ -626,41 +635,30 @@ static dattr sep_attr(void) { return has_colors() ? COLOR_PAIR(C_SEP) | A_BOLD :
 /* Heavy box-drawing glyphs need a UTF-8 locale; otherwise fall back to ACS. */
 static int heavy_ok(void) { return MB_CUR_MAX > 1; }
 
-static void sep_glyph(int y, int x, const char *heavy, chtype acs)
-{
-    if (heavy_ok())
-        put(y, x, 1, sep_attr(), heavy);
-    else {
-        attrset(sep_attr());
-        mvaddch(y, x, acs);
-        attrset(A_NORMAL);
-    }
-}
+/* The focused pane's rule and title take the accent colour. */
+static dattr focus_attr(void) { return has_colors() ? COLOR_PAIR(C_ACCENT) | A_BOLD : A_BOLD; }
 
-static void sep_hline(int y, int x, int w)
+static void rule(int y, int x, int w, dattr attr)
 {
     if (w <= 0) return;
     if (!heavy_ok()) {
-        attrset(sep_attr());
+        attrset(attr);
         mvhline(y, x, ACS_HLINE, w);
         attrset(A_NORMAL);
         return;
     }
     sb_t line = {0};
     for (int i = 0; i < w; i++) sb_adds(&line, "\xe2\x94\x81"); /* ━ */
-    put(y, x, w, sep_attr(), line.p);
+    put(y, x, w, attr, line.p);
     sb_free(&line);
 }
 
-static void sep_vline(int y, int x, int h)
+/* A pane's title row. The focused one is bracketed as well as coloured, so
+ * it also stands out without colours. */
+static void section(int y, int x, int w, const char *label, int focused)
 {
-    for (int i = 0; i < h; i++) sep_glyph(y + i, x, "\xe2\x94\x83", ACS_VLINE); /* ┃ */
-}
-
-static void section(int y, int x, int w, const char *label)
-{
-    sep_hline(y, x, w);
-    putf(y, x + 2, w - 4, A_BOLD, " %s ", label);
+    rule(y, x, w, focused ? focus_attr() : sep_attr());
+    putf(y, x + 2, w - 4, focused ? focus_attr() | A_REVERSE : A_BOLD, focused ? "[%s]" : " %s ", label);
 }
 
 static uint64_t age(const cJSON *a, const char *key, uint64_t now)
@@ -675,7 +673,7 @@ static void draw_agent_detail(const dash_t *d, const cJSON *a, int y, int w, int
     const char *tool = jstr(a, "last_tool"), *line = pane_text(d, name);
     char title[80], elapsed[16];
     snprintf(title, sizeof title, "%s / %s", name, kind ? kind : "-");
-    section(y, 0, w, title);
+    section(y, 0, w, title, 0);
 
     fmt_dur(elapsed, sizeof elapsed, age(a, "state_ts", now));
     int flash = flashing(d, name);
@@ -718,7 +716,8 @@ static void draw_agents_list(dash_t *d, const cJSON **agents, int n, int y, int 
         snprintf(title, sizeof title, "Agents %d-%d/%d", d->top + 1, end, n);
     else
         snprintf(title, sizeof title, "Agents %d", n);
-    section(y, 0, w, title);
+    section(y, 0, w, title, d->focus == F_AGENTS);
+    d->grid_cols = 1;
     if (!n) put(y + 1, 2, w - 3, A_DIM, "No agents yet");
     for (int i = d->top; i < end; i++) {
         const cJSON *a = agents[i];
@@ -995,7 +994,8 @@ static int draw_agents_graph(dash_t *d, const cJSON **agents, int n, int y, int 
         snprintf(title, sizeof title, "Agents %d-%d/%d", first + 1, end, n);
     else
         snprintf(title, sizeof title, "Agents %d", n);
-    section(y, 0, w, title);
+    section(y, 0, w, title, d->focus == F_AGENTS);
+    d->grid_cols = g.cols;
 
     int used = GH + g.prow * (g.ch + GH);
     canvas_t c = {.w = w, .h = used};
@@ -1052,8 +1052,8 @@ static void draw_agents(dash_t *d, const cJSON **agents, int n, int y, int h, in
     draw_agents_list(d, agents, n, y, h, w, now);
 }
 
-/* ---- agent terminal colours ------------------------------------------- *
- * The preview is captured with `capture-pane -e`, so it carries the pane's
+/* ---- terminal colours -------------------------------------------------- *
+ * The shell is captured with `capture-pane -e`, so it carries the pane's
  * SGR escapes. tmux only emits the difference from the previous cell, so the
  * state runs on across lines and has to be tracked from the top. */
 
@@ -1321,14 +1321,6 @@ static int fetch_screen(screen_t *sc, const char *pane)
     return changed;
 }
 
-static int fetch_chat(dash_t *d)
-{
-    d->t_chat = now_ms();
-    const char *pane = jstr(selected(d), "pane");
-    if (pane && d->own_pane && !strcmp(pane, d->own_pane)) pane = NULL;
-    return fetch_screen(&d->chat, pane);
-}
-
 /* Draws the tail of a captured screen into h rows at (y, x), w cells wide,
  * keeping the cursor row in view. *cy is set to the cursor's screen row
  * (-1 when it is not shown). */
@@ -1372,19 +1364,6 @@ static void draw_screen(screen_t *sc, int y, int h, int x, int w, int *cy, int *
         *end = '\n';
         line = end + 1;
     }
-}
-
-static void draw_chat(dash_t *d, const cJSON *a, int y, int h, int x, int w)
-{
-    char title[80] = "Agent terminal";
-    if (a) snprintf(title, sizeof title, "Agent terminal / %s", jstr(a, "name"));
-    section(y, x, w, title);
-    if (h < 2) return;
-    if (!a || !d->chat.text.p || strcmp(d->chat.pane, jstr(a, "pane"))) {
-        put(y + 1, x + 2, w - 3, A_DIM, a ? "Pane unavailable" : "No agent selected");
-        return;
-    }
-    draw_screen(&d->chat, y + 1, h - 1, x + 2, w - 3, &d->cursor_screen_y, &d->cursor_screen_x);
 }
 
 /* ---- shell tab ----------------------------------------------------------- */
@@ -1448,18 +1427,75 @@ static int fetch_term(dash_t *d)
     return fetch_screen(&d->term, term_pane(d, d->term_w, d->term_h));
 }
 
-/* Forwards one key from the dashboard to the shell. Text is batched in
- * `lit` and sent by term_flush(); anything else goes as a tmux key name. */
-static void term_flush(dash_t *d, sb_t *lit)
+/* ---- focus --------------------------------------------------------------- */
+
+/* Does the focused pane forward its keys to a tmux pane? */
+static int typing(const dash_t *d)
 {
-    if (lit->len && d->term_pane[0])
-        tmux(NULL, NULL, "send-keys", "-l", "-t", d->term_pane, "--", lit->p, NULL);
+    return d->focus == F_BOTTOM && d->tab == TAB_TERM;
+}
+
+/* The tmux pane behind the focused terminal. NULL when there is none to
+ * type into. */
+static const char *focus_pane(const dash_t *d)
+{
+    return typing(d) && d->term_pane[0] ? d->term_pane : NULL;
+}
+
+static void set_focus(dash_t *d, int to)
+{
+    d->focus = to;
+    d->t_term = 0;
+}
+
+/* Moves the focus to the pane on that side of the focused one: the bottom
+ * panel is below the roster. Returns 0 when there is none. */
+static int move_focus(dash_t *d, int dir)
+{
+    int to = d->focus == F_AGENTS && dir == D_DOWN   ? F_BOTTOM
+             : d->focus == F_BOTTOM && dir == D_UP ? F_AGENTS
+                                                   : -1;
+    if (to < 0 || (to == F_BOTTOM && !d->has_bottom)) return 0;
+    set_focus(d, to);
+    return 1;
+}
+
+/* An arrow key in the roster: the selection moves across the tiles, and
+ * from the bottom row the focus moves on to the changed files. It never
+ * moves on to the shell, which would take every key from then on: that one
+ * has to be focused on purpose (Tab, Shift+Down or :term). */
+static void roster_move(dash_t *d, int dir)
+{
+    const cJSON *cards[64];
+    int n = d->stats ? pane_agents(d, cards, 64) : 0;
+    int cols = d->grid_cols > 0 ? d->grid_cols : 1, to = -1;
+    switch (dir) {
+    case D_UP: to = d->sel - cols; break;
+    case D_DOWN:
+        to = d->sel + cols;
+        /* Above a short last row: step onto its last tile. */
+        if (to >= n && d->sel / cols < (n - 1) / cols) to = n - 1;
+        break;
+    case D_LEFT: to = d->sel % cols ? d->sel - 1 : -1; break;
+    case D_RIGHT: to = d->sel % cols < cols - 1 ? d->sel + 1 : n; break;
+    }
+    if (to >= 0 && to < n)
+        d->sel = to;
+    else if (d->tab != TAB_TERM)
+        move_focus(d, dir);
+}
+
+/* Forwards one key from the dashboard to a terminal pane. Text is batched
+ * in `lit` and sent by term_flush(); anything else goes as a tmux key name. */
+static void term_flush(const char *pane, sb_t *lit)
+{
+    if (lit->len && pane) tmux(NULL, NULL, "send-keys", "-l", "-t", pane, "--", lit->p, NULL);
     sb_free(lit);
 }
 
-static void term_key(dash_t *d, int ch, sb_t *lit)
+static void term_key(const char *pane, int ch, sb_t *lit)
 {
-    if (!d->term_pane[0]) return;
+    if (!pane) return;
     char key[16] = "";
     switch (ch) {
     case '\n': case '\r': case KEY_ENTER: snprintf(key, sizeof key, "Enter"); break;
@@ -1489,26 +1525,47 @@ static void term_key(dash_t *d, int ch, sb_t *lit)
         }
     }
     if (key[0]) {
-        term_flush(d, lit);
-        tmux(NULL, NULL, "send-keys", "-t", d->term_pane, key, NULL);
+        term_flush(pane, lit);
+        tmux(NULL, NULL, "send-keys", "-t", pane, key, NULL);
     }
 }
 
+/* The bottom panel's title row: one label per tab, and what the keys do. */
 static void draw_tabs(const dash_t *d, int y, int w, size_t nfiles)
 {
-    sep_hline(y, 0, w);
-    char files[48];
-    snprintf(files, sizeof files, " Changed files %zu ", nfiles);
-    const char *term = d->term_focus ? " Terminal (typing) " : " Terminal ";
-    dattr on = A_BOLD | A_REVERSE, off = A_DIM;
+    int focused = d->focus == F_BOTTOM;
+    rule(y, 0, w, focused ? focus_attr() : sep_attr());
+    char files[64];
+    if (d->tab == TAB_FILES && d->files_shown > 0 && (size_t)d->files_shown < nfiles)
+        snprintf(files, sizeof files, "Changed files %d-%d/%zu", d->files_top + 1,
+                 d->files_top + d->files_shown, nfiles);
+    else
+        snprintf(files, sizeof files, "Changed files %zu", nfiles);
     int x = 2;
-    put(y, x, w - x - 1, d->tab == TAB_FILES ? on : off, files);
-    x += (int)strlen(files) + 1;
-    put(y, x, w - x - 1, d->tab == TAB_TERM ? on : off, term);
-    x += (int)strlen(term) + 1;
-    const char *hint = d->term_focus ? " F12 stop typing " : d->tab == TAB_TERM ? " i type   Tab files " : " Tab terminal ";
-    int hl = (int)strlen(hint);
-    if (w - hl - 2 > x) put(y, w - hl - 2, hl, A_DIM, hint);
+    for (int t = TAB_FILES; t <= TAB_TERM; t++) {
+        const char *label = t == TAB_FILES ? files : "Terminal";
+        int on = d->tab == t;
+        putf(y, x, w - x - 1, !on ? A_DIM : focused ? focus_attr() | A_REVERSE : A_BOLD,
+             on && focused ? "[%s]" : " %s ", label);
+        x += (int)strlen(label) + 3;
+    }
+    const char *hint[2] = {" Tab terminal ", ""};
+    if (focused && d->tab == TAB_TERM) {
+        hint[0] = " F12 or Shift+Up leave   :: types a colon ";
+        hint[1] = " F12 leave ";
+    } else if (focused) {
+        hint[0] = " Up/Down scroll   Tab terminal ";
+        hint[1] = " Tab terminal ";
+    } else if (d->tab == TAB_TERM) {
+        hint[0] = " Tab type here   :files changed files ";
+        hint[1] = " Tab type here ";
+    }
+    for (int i = 0; i < 2; i++) {
+        int hl = (int)strlen(hint[i]);
+        if (!hl || w - hl - 2 <= x) continue;
+        put(y, w - hl - 2, hl, A_DIM, hint[i]);
+        break;
+    }
 }
 
 static void draw_term(dash_t *d, int y, int h, int w)
@@ -1526,25 +1583,27 @@ static void draw_term(dash_t *d, int y, int h, int w)
     draw_screen(&d->term, y + 1, th, 1, tw, &d->term_screen_y, &d->term_screen_x);
 }
 
-static void draw_files(const file_row *rows, size_t n, int y, int h, int w)
+/* The files list under its tab row (draw_tabs). Up/Down scroll it while it
+ * has the focus. */
+static void draw_files(dash_t *d, const file_row *rows, size_t n, int y, int h, int w)
 {
-    char title[64];
-    size_t shown = h > 2 ? (size_t)(h - 2) : 0;
-    if (shown > n) shown = n;
-    if (shown < n)
-        snprintf(title, sizeof title, "Changed files %zu/%zu", shown, n);
-    else
-        snprintf(title, sizeof title, "Changed files %zu", n);
-    section(y, 0, w, title);
+    int room = h > 2 ? h - 2 : 0, count = (int)n;
+    if (d->files_top > count - room) d->files_top = count - room;
+    if (d->files_top < 0) d->files_top = 0;
+    d->files_shown = count - d->files_top < room ? count - d->files_top : room;
 
+    if (!n) {
+        put(y + 1, 2, w - 3, A_DIM, "No changes");
+        return;
+    }
     int delta = w < 48 ? 10 : w < 72 ? 12 : 14;
     int git = w - delta * 2 - 2, agents = git + delta;
     put(y + 1, 2, git - 3, A_DIM, "Path / contributors");
     put(y + 1, git, delta - 1, A_DIM, "Git");
     put(y + 1, agents, delta - 1, A_DIM, "Agents");
-    for (size_t i = 0; i < shown; i++) {
-        const file_row *r = &rows[i];
-        int row = y + 2 + (int)i;
+    for (int i = 0; i < d->files_shown; i++) {
+        const file_row *r = &rows[d->files_top + i];
+        int row = y + 2 + i;
         putf(row, 2, git - 3, 0, "%s%s%s%s", r->path, r->who[0] ? "  [" : "",
              r->who, r->who[0] ? "]" : "");
         if (r->gadd >= 0) putf(row, git, delta - 1, 0, "+%ld -%ld", r->gadd, r->gdel);
@@ -1553,20 +1612,26 @@ static void draw_files(const file_row *rows, size_t n, int y, int h, int w)
 }
 
 static const char *const help_lines[] = {
-    "Up/Down or j/k         Select an agent",
-    "Enter, t or F4         Take over selected agent (to type into it)",
-    "s                      Send a message to the selected agent",
+    "Shift+Arrows           Focus the next pane (the highlighted title)",
+    "Arrows or h/j/k/l      Select an agent, scroll the changed files",
+    "Tab / Shift+Tab        Focus the terminal / the changed files",
     ": or F2                Open command prompt",
+    "Enter, t or F4         Take over selected agent (full screen)",
+    "s                      Send a message to the selected agent",
     "r or F5                Refresh",
-    "Tab                    Switch bottom panel: changed files / terminal",
-    "i                      Type into the terminal (F12 or Ctrl-q stops)",
-    "F12 or Ctrl-q          Return from takeover",
     "q or Ctrl-q            Leave dashboard",
     "",
-    ":takeover N|name        Show an agent",
+    "The terminal is typed into once it has the focus (Tab, Shift+Down",
+    "or :term; plain arrows never enter it). It gets every key except:",
+    "Shift+Up               Focus the agents",
+    "F12 or Ctrl-q          Back to the agents (also ends a takeover)",
+    ":                      Command prompt; :: types a colon",
+    "",
+    ":takeover N|name        Show an agent full screen",
     ":send N|name|all text   Send a message",
     ":spawn agent [args]     Start an agent",
     ":kill N|name            Stop an agent",
+    ":agents :files :term    Focus the agents, changed files or terminal",
     ":grid                  Show whole grid",
     ":nuke!                 Stop every agent",
     ":q                     Leave dashboard",
@@ -1578,23 +1643,42 @@ static void draw_help(dash_t *d, int h, int w)
     int room = h > 4 ? h - 4 : 0;
     int max_top = count > room ? count - room : 0;
     if (d->help_top > max_top) d->help_top = max_top;
-    if (h >= 4) section(2, 0, w, "Dashboard help");
+    if (h >= 4) section(2, 0, w, "Dashboard help", 0);
     for (int i = 0; i < room && d->help_top + i < count; i++)
         put(3 + i, 2, w - 3, 0, help_lines[d->help_top + i]);
     put(h - 1, 1, w - 2, A_BOLD, "Esc / F1  Close help    Up/Down  Scroll");
 }
 
 /* Bottom shortcut strip. Bordered (3 rows) when there is room, otherwise a
- * single plain row. Status messages take over the text row. Returns rows used. */
-static int draw_command_bar(const dash_t *d, int h, int w, uint64_t now)
+ * single plain row. */
+static int command_bar_boxed(int h, int w) { return h >= 16 && w >= 24; }
+static int command_bar_rows(int h, int w) { return command_bar_boxed(h, w) ? 3 : 1; }
+
+/* Shows the keys of the focused pane. Status messages take over the text row. */
+static void draw_command_bar(const dash_t *d, int h, int w, uint64_t now)
 {
-    static const char *const keys[] = {
-        "Up/Down Select   Enter Take over   s Send   Tab Terminal   : Command   ? Help   q Quit",
-        "Up/Down Select   Enter Take over   s Send   : Cmd   ? Help",
-        "Up/Down   Enter Take over   : Cmd",
-        ": Cmd   ? Help   q Quit",
+    static const char *const sets[3][4] = {
+        { /* the roster */
+            "Arrows Move   Enter Take over   s Send   Tab Terminal   : Command   ? Help   q Quit",
+            "Arrows Move   Enter Take over   s Send   : Cmd   ? Help",
+            "Arrows Move   Enter Take over   : Cmd",
+            ": Cmd   ? Help   q Quit",
+        },
+        { /* the shell: every other key is typed into it */
+            "F12 Leave   Shift+Up Agents   : Command   :: Type a colon",
+            "F12 Leave   Shift+Up Agents   : Cmd",
+            "F12 Leave   : Cmd",
+            "F12 Leave",
+        },
+        { /* the changed files */
+            "Up/Down Scroll   Esc Agents   Tab Terminal   : Command   ? Help   q Quit",
+            "Up/Down Scroll   Tab Terminal   : Cmd   ? Help",
+            "Up/Down Scroll   : Cmd",
+            ": Cmd   ? Help   q Quit",
+        },
     };
-    int boxed = h >= 16 && w >= 24;
+    const char *const *keys = sets[typing(d) ? 1 : d->focus == F_BOTTOM ? 2 : 0];
+    int boxed = command_bar_boxed(h, w);
     int inner = boxed ? w - 4 : w - 2;
     int ti = 3;
     for (int i = 0; i < 4; i++)
@@ -1627,13 +1711,12 @@ static int draw_command_bar(const dash_t *d, int h, int w, uint64_t now)
             if (key) key += strspn(key, " ");
         }
     }
-    return boxed ? 3 : 1;
 }
 
 static void draw(dash_t *d)
 {
     erase();
-    d->cursor_screen_y = d->term_screen_y = -1;
+    d->term_screen_y = -1;
     int h = LINES, w = COLS;
     uint64_t now = now_ms();
     const char *base = strrchr(d->c->p.dir, '/');
@@ -1643,15 +1726,17 @@ static void draw(dash_t *d)
     if (d->help) {
         draw_help(d, h, w);
     } else {
-        int bar = draw_command_bar(d, h, w, now);
+        int bar = command_bar_rows(h, w);
 
         if (!d->stats) {
+            d->has_bottom = 0;
             if (h >= 3) put(1, 1, w - 2, A_DIM, d->c->p.dir);
             if (h >= 6) {
-                section(3, 0, w, "No grid running");
-                put(4, 2, w - 3, 0, "Press F2 and enter spawn claude");
+                section(3, 0, w, "No grid running", 0);
+                put(4, 2, w - 3, 0, "Press : and enter spawn claude");
             }
-        } else if (h < CHAT_MIN_HEIGHT || w < CHAT_MIN_WIDTH) {
+        } else if (h < DASH_MIN_HEIGHT || w < DASH_MIN_WIDTH) {
+            d->has_bottom = 0;
             if (h >= 3) put(1, 1, w - 2, A_DIM, "Resize for dashboard");
         } else {
             const cJSON *agents[64];
@@ -1677,7 +1762,6 @@ static void draw(dash_t *d)
 
             file_row *rows;
             size_t nr = file_rows(d, &rows);
-            int wide = w >= 80;
             /* Bottom panel: tab row plus changed files or the shell. */
             int files = 0;
             if (h >= 16) {
@@ -1691,40 +1775,29 @@ static void draw(dash_t *d)
                 if (h - 3 - bar - files < 8) files = h - 3 - bar - 8;
                 if (files < 2) files = 0;
             }
+            /* What move_focus() goes by. A bottom panel that no longer fits
+             * hands the focus back to the roster. */
+            d->has_bottom = files > 0;
+            if (d->focus == F_BOTTOM && !files) set_focus(d, F_AGENTS);
             int body = h - 3 - bar - files;
-            int roster = wide ? body : body * 2 / 3;
-            if (!wide && n && body >= 12 && roster < 9) roster = 9;
-            if (!wide && roster > n + 8) roster = n + 8;
-            if (!wide && roster > body - 2) roster = body - 2;
-            int split = wide ? w * 46 / 100 : w;
-            draw_agents(d, agents, n, 3, roster, split, now);
-            if (wide) {
-                sep_vline(3, split, body);
-                sep_glyph(3, split, "\xe2\x94\xb3", ACS_TTEE); /* ┳ */
-                draw_chat(d, n ? agents[d->sel] : NULL, 3, body, split + 1, w - split - 1);
-            } else {
-                draw_chat(d, n ? agents[d->sel] : NULL, 3 + roster, body - roster, 0, w);
-            }
+            draw_agents(d, agents, n, 3, body, w, now);
             if (files) {
                 if (d->tab == TAB_TERM) {
                     draw_tabs(d, 3 + body, w, nr);
                     draw_term(d, 3 + body, files, w);
                 } else {
-                    draw_files(rows, nr, 3 + body, files, w);
+                    draw_files(d, rows, nr, 3 + body, files, w);
                     draw_tabs(d, 3 + body, w, nr);
-                    if (!nr && files > 1) put(4 + body, 2, w - 3, A_DIM, "No changes");
                 }
-                if (wide) sep_glyph(3 + body, split, "\xe2\x94\xbb", ACS_BTEE); /* ┻ */
             }
             free(rows);
         }
+        draw_command_bar(d, h, w, now);
     }
-    /* Show the agent's cursor as a highlighted cell, not the terminal cursor:
-     * the tile is display only and must not look like it takes input. */
-    if (d->cursor_screen_y >= 0 && !d->term_focus)
-        mvchgat(d->cursor_screen_y, d->cursor_screen_x, 1, A_REVERSE, 0, NULL);
+    /* The shell's cursor is a highlighted cell, not the real cursor: a block
+     * while it takes the keys, an underline while it does not. */
     if (d->term_screen_y >= 0 && d->tab == TAB_TERM)
-        mvchgat(d->term_screen_y, d->term_screen_x, 1, d->term_focus ? A_REVERSE : A_DIM, 0, NULL);
+        mvchgat(d->term_screen_y, d->term_screen_x, 1, d->focus == F_BOTTOM ? A_REVERSE : A_UNDERLINE, 0, NULL);
     refresh();
 }
 
@@ -1741,10 +1814,39 @@ static const cJSON *selected(const dash_t *d)
     return d->sel < n ? cards[d->sel] : NULL;
 }
 
+/* Shows one of the bottom panel's tabs and moves the focus to it. */
+static void show_bottom(dash_t *d, int tab)
+{
+    if (!d->has_bottom) {
+        set_status(d, d->stats ? "the window is too small for the bottom panel"
+                               : "no grid is running here; start an agent with :spawn claude");
+        return;
+    }
+    d->tab = tab;
+    set_focus(d, F_BOTTOM);
+}
+
 /* Bracketed paste lets the dashboard drop pasted text instead of reading it
  * as shortcuts. It is off while a prompt line reads text. */
-enum { KEY_PASTE_START = KEY_MAX + 1, KEY_PASTE_END };
+enum { KEY_PASTE_START = KEY_MAX + 1, KEY_PASTE_END, KEY_FOCUS_UP, KEY_FOCUS_DOWN, KEY_FOCUS_LEFT, KEY_FOCUS_RIGHT };
 static int paste_supported;
+
+/* Shift+arrow moves the focus, out of a terminal pane too, where the plain
+ * arrows belong to the program running in it. Returns the direction, or 0. */
+static int focus_dir(int ch)
+{
+    switch (ch) {
+    case KEY_FOCUS_UP: case KEY_SR: return D_UP;
+    case KEY_FOCUS_DOWN: case KEY_SF: return D_DOWN;
+    case KEY_FOCUS_LEFT: case KEY_SLEFT: return D_LEFT;
+    case KEY_FOCUS_RIGHT: case KEY_SRIGHT: return D_RIGHT;
+#ifdef KEY_SUP /* PDCurses */
+    case KEY_SUP: return D_UP;
+    case KEY_SDOWN: return D_DOWN;
+#endif
+    }
+    return 0;
+}
 
 static void paste_mode(int enabled)
 {
@@ -1753,15 +1855,16 @@ static void paste_mode(int enabled)
     fflush(stdout);
 }
 
-/* Reads one line at the bottom of the screen. Empty on Escape. */
-static void prompt_line(const char *label, char *buf, size_t len)
+/* Reads one line at the bottom of the screen. Empty on Escape. With `colon`
+ * (the prompt was opened by ':' in a terminal pane), a second ':' straight
+ * away returns 1 instead: the caller types a colon into the terminal. */
+static int prompt_line(const char *label, char *buf, size_t len, int colon)
 {
     buf[0] = '\0';
     paste_mode(0);
     move(LINES - 1, 0);
     clrtoeol();
     put(LINES - 1, 0, COLS, A_BOLD, label);
-    echo();
     curs_set(1);
     nodelay(stdscr, FALSE);
 #ifdef _WIN32
@@ -1769,12 +1872,19 @@ static void prompt_line(const char *label, char *buf, size_t len)
      * expect its reads to time out and stores a junk character each time. */
     timeout(-1);
 #endif
-    getnstr(buf, (int)len - 1);
+    int first = getch();
+    int literal = colon && first == ':';
+    if (!literal && first != 27) {
+        if (first != ERR) ungetch(first);
+        echo();
+        getnstr(buf, (int)len - 1);
+        noecho();
+    }
     nodelay(stdscr, TRUE);
     curs_set(0);
-    noecho();
     paste_mode(1);
     if (strchr(buf, 27)) buf[0] = '\0';
+    return literal;
 }
 
 /* An agent by number in the list (1-based), by name, or by @name. */
@@ -1838,7 +1948,7 @@ static void takeover(dash_t *d, const cJSON *a)
     paste_mode(1);
     clearok(stdscr, TRUE);
     flushinp();
-    d->t_stats = d->t_git = d->t_panes = d->t_chat = 0;
+    d->t_stats = d->t_git = d->t_panes = 0;
     if (a) {
         char msg[128];
         snprintf(msg, sizeof msg, "back from %s", jstr(a, "name"));
@@ -1863,7 +1973,13 @@ static int run_command(dash_t *d, char *line)
         set_status(d, "no grid is running here; start an agent with :spawn claude");
         if (strcmp(cmd, "spawn") && strcmp(cmd, "new")) return 0;
     }
-    if (!strcmp(cmd, "takeover") || !strcmp(cmd, "t") || !strcmp(cmd, "to")) {
+    if (!strcmp(cmd, "agents")) {
+        set_focus(d, F_AGENTS);
+    } else if (!strcmp(cmd, "files")) {
+        show_bottom(d, TAB_FILES);
+    } else if (!strcmp(cmd, "term") || !strcmp(cmd, "terminal")) {
+        show_bottom(d, TAB_TERM);
+    } else if (!strcmp(cmd, "takeover") || !strcmp(cmd, "t") || !strcmp(cmd, "to")) {
         const cJSON *a = find_agent(d, rest ? strtok_r(NULL, " \t", &save) : NULL);
         if (a)
             takeover(d, a);
@@ -1963,15 +2079,21 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
     signal(SIGBREAK, on_console_break);
 #endif
 
-    if (tmux_inside_session(c->p.session)) d.own_pane = getenv("TMUX_PANE");
 #ifndef _WIN32
     /* PDCurses has no define_key; the Windows console pastes as key events. */
     paste_supported = define_key("\033[200~", KEY_PASTE_START) == OK &&
                       define_key("\033[201~", KEY_PASTE_END) == OK;
+    /* Shift+arrows as xterm and tmux send them; not every terminfo entry
+     * lists all four. */
+    define_key("\033[1;2A", KEY_FOCUS_UP);
+    define_key("\033[1;2B", KEY_FOCUS_DOWN);
+    define_key("\033[1;2D", KEY_FOCUS_LEFT);
+    define_key("\033[1;2C", KEY_FOCUS_RIGHT);
 #endif
     paste_mode(1);
 
     int quit = 0, dirty = 1, pasting = 0;
+    sb_t pasted = {0}; /* a paste into the focused terminal, until it ends */
     uint64_t last_draw = 0;
     while (!quit) {
         uint64_t now = now_ms();
@@ -1981,8 +2103,9 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
         }
         if (d.stats && now - d.t_panes >= 2000) fetch_panes(&d);
         if (now - d.t_git >= 3000) fetch_git(&d);
-        if (!d.help && now - d.t_chat >= CHAT_REFRESH_MS) dirty |= fetch_chat(&d);
-        if (!d.help && d.tab == TAB_TERM && now - d.t_term >= (d.term_focus ? 60 : CHAT_REFRESH_MS))
+        /* The terminal being typed into is redrawn as fast as it echoes. */
+        int fast = typing(&d);
+        if (!d.help && d.tab == TAB_TERM && now - d.t_term >= (uint64_t)(fast ? 60 : REFRESH_MS))
             dirty |= fetch_term(&d);
         if (dirty || last_draw < d.animate_until || now - last_draw >= 1000) {
             draw(&d);
@@ -1993,43 +2116,37 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
 #ifdef _WIN32
         /* Console input and the SUB socket cannot be waited on together:
          * wait briefly for a key, then drain the socket without blocking. */
-        timeout(d.term_focus ? 60 : 100);
+        timeout(fast ? 60 : 100);
         int key = getch();
         nodelay(stdscr, TRUE);
         if (key != ERR) ungetch(key);
 #else
         struct pollfd pfd[2] = {{STDIN_FILENO, POLLIN, 0}, {d.subfd, POLLIN, 0}};
-        poll(pfd, d.subfd >= 0 ? 2 : 1, d.term_focus ? 60 : now < d.animate_until ? 90 : CHAT_REFRESH_MS);
+        poll(pfd, d.subfd >= 0 ? 2 : 1, fast ? 60 : now < d.animate_until ? 90 : REFRESH_MS);
 #endif
         /* Refresh the roster before drawing again, so input in this frame
          * still targets the pane already on screen. */
         if (drain_events(&d)) d.t_stats = 0;
 
-        /* The agent tile is display only: keys drive the dashboard and never
-         * reach the agent. Typing into an agent needs a takeover. */
-        sb_t lit = {0}; /* text typed into the shell this frame */
+        /* Keys go to the focused pane and to no other. The shell passes them
+         * all on to its tmux pane, apart from the ones that move the focus
+         * and ':' for the command prompt. */
+        sb_t lit = {0}; /* text typed into a terminal this frame */
         for (int ch; !quit && (ch = getch()) != ERR;) {
             if (ch == KEY_PASTE_START || ch == KEY_PASTE_END) {
                 pasting = ch == KEY_PASTE_START;
-                continue;
-            }
-            if (d.term_focus) {
-                /* Typing mode: every key goes to the shell except the two
-                 * that leave it, the same ones that end a takeover. */
-                dirty = 1;
-                if (!pasting && (ch == KEY_F(12) || ch == 17)) {
-                    d.term_focus = 0;
-                } else if (pasting && (ch == '\n' || ch == '\r')) {
-                    char nl = '\r';
-                    sb_add(&lit, &nl, 1);
-                } else {
-                    term_key(&d, ch, &lit);
+                if (!pasting && pasted.len) {
+                    /* One paste for the terminal, as it was one here: its
+                     * newlines stay text and do not each submit a line. */
+                    const char *pane = focus_pane(&d);
+                    term_flush(pane, &lit);
+                    if (pane) tmux_paste(pane, pasted.p);
+                    d.t_term = 0;
+                    dirty = 1;
                 }
-                d.t_term = 0;
+                sb_free(&pasted);
                 continue;
             }
-            if (pasting) continue;
-            dirty = 1;
 #ifdef _WIN32
             /* PDCurses reports a resized console but leaves the resize to us. */
             if (ch == KEY_RESIZE) {
@@ -2040,10 +2157,13 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
                     if (k != KEY_RESIZE) keep[n++] = k;
                 resize_term(0, 0);
                 while (n > 0) ungetch(keep[--n]);
+                dirty = 1;
                 continue;
             }
 #endif
             if (d.help) {
+                if (pasting) continue;
+                dirty = 1;
                 switch (ch) {
                 case KEY_UP: case 'k':
                     if (d.help_top > 0) d.help_top--;
@@ -2056,30 +2176,87 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
                 }
                 continue;
             }
-            const cJSON *a = selected(&d);
+            int dir = pasting ? 0 : focus_dir(ch);
+            if (typing(&d)) {
+                const char *pane = focus_pane(&d);
+                dirty = 1;
+                d.t_term = 0;
+                if (pasting) {
+                    char byte = ch == '\r' ? '\n' : (char)ch;
+                    if (ch > 0 && ch < 256) sb_add(&pasted, &byte, 1);
+                } else if (!dir && ch != ':' && ch != KEY_F(12) && ch != 17) {
+                    term_key(pane, ch, &lit);
+                } else {
+                    /* Not for the terminal. What was typed before it goes
+                     * out first, to the pane it was typed into. */
+                    term_flush(pane, &lit);
+                    if (dir) {
+                        move_focus(&d, dir);
+                    } else if (ch == ':') {
+                        char line[1024];
+                        if (prompt_line(":", line, sizeof line, 1))
+                            sb_add(&lit, ":", 1);
+                        else if (run_command(&d, line))
+                            quit = 1;
+                    } else {
+                        /* F12 and Ctrl-q, the keys that end a takeover. */
+                        set_focus(&d, F_AGENTS);
+                    }
+                }
+                continue;
+            }
+            if (pasting) continue;
+            dirty = 1;
+            if (dir) {
+                move_focus(&d, dir);
+                continue;
+            }
+            /* The roster and the files list share the dashboard's own keys. */
             switch (ch) {
             case 'q': case 'Q': case 17: /* Ctrl-q */
                 quit = 1;
-                break;
-            case KEY_UP: case 'k':
-                if (d.sel > 0) d.sel--;
-                d.t_chat = 0;
-                break;
-            case KEY_DOWN: case 'j':
-                d.sel++;
-                if (!selected(&d)) d.sel--;
-                d.t_chat = 0;
-                break;
+                continue;
             case '?': case KEY_F(1):
                 d.help = 1;
                 d.help_top = 0;
-                break;
+                continue;
             case ':': case KEY_F(2): {
                 char line[1024];
-                prompt_line(":", line, sizeof line);
+                prompt_line(":", line, sizeof line, 0);
                 if (run_command(&d, line)) quit = 1;
-                break;
+                continue;
             }
+            case 'r': case KEY_F(5):
+                d.t_stats = d.t_git = d.t_panes = d.t_term = 0;
+                continue;
+            case '\t':
+                show_bottom(&d, TAB_TERM);
+                continue;
+            case KEY_BTAB:
+                show_bottom(&d, TAB_FILES);
+                continue;
+            }
+            if (d.focus == F_BOTTOM) {
+                switch (ch) {
+                case KEY_UP: case 'k':
+                    if (d.files_top > 0)
+                        d.files_top--;
+                    else
+                        move_focus(&d, D_UP);
+                    break;
+                case KEY_DOWN: case 'j':
+                    d.files_top++; /* draw_files() stops it at the end */
+                    break;
+                case 27: set_focus(&d, F_AGENTS); break;
+                }
+                continue;
+            }
+            const cJSON *a = selected(&d);
+            switch (ch) {
+            case KEY_UP: case 'k': roster_move(&d, D_UP); break;
+            case KEY_DOWN: case 'j': roster_move(&d, D_DOWN); break;
+            case KEY_LEFT: case 'h': roster_move(&d, D_LEFT); break;
+            case KEY_RIGHT: case 'l': roster_move(&d, D_RIGHT); break;
             case 't': case '\n': case '\r': case KEY_ENTER: case KEY_F(4):
                 if (a) takeover(&d, a);
                 break;
@@ -2087,26 +2264,14 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
                 if (a) {
                     char label[96], text[1024];
                     snprintf(label, sizeof label, " send to @%s: ", jstr(a, "name"));
-                    prompt_line(label, text, sizeof text);
+                    prompt_line(label, text, sizeof text, 0);
                     if (text[0]) send_to(&d, jstr(a, "name"), text);
                 }
-                break;
-            case 'r': case KEY_F(5):
-                d.t_stats = d.t_git = d.t_panes = d.t_chat = d.t_term = 0;
-                break;
-            case '\t':
-                d.tab = d.tab == TAB_TERM ? TAB_FILES : TAB_TERM;
-                d.t_term = 0;
-                break;
-            case 'i':
-                d.tab = TAB_TERM;
-                d.term_focus = 1;
-                d.t_term = 0;
                 break;
             default: break;
             }
         }
-        term_flush(&d, &lit);
+        term_flush(focus_pane(&d), &lit);
     }
     paste_mode(0);
     endwin();
@@ -2117,7 +2282,7 @@ int cmd_dash(nq_ctx *c, int argc, char **argv)
         tmux(NULL, NULL, "kill-session", "-t", target, NULL);
     }
     disconnect(&d);
-    sb_free(&d.chat.text);
+    sb_free(&pasted);
     sb_free(&d.term.text);
     cJSON_Delete(d.git);
     free(d.panes);

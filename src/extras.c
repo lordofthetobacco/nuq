@@ -54,13 +54,18 @@ int cmd_doctor(nq_ctx *c, int argc, char **argv)
     }
 
     /* Agents are optional: report, do not fail. */
-    static const char *const agents[] = {"claude", "codex", NULL};
+    static const char *const agents[] = {"claude", "codex", "pi", "devin", NULL};
     for (int i = 0; agents[i]; i++) {
         if (find_on_path(agents[i], buf, sizeof buf) == 0)
             check(1, agents[i], buf);
         else
             printf("  --    %-22s not installed\n", agents[i]);
     }
+    /* Cursor's CLI is installed as "agent"; older installs have "cursor-agent". */
+    if (find_on_path("agent", buf, sizeof buf) == 0 || find_on_path("cursor-agent", buf, sizeof buf) == 0)
+        check(1, "agent (Cursor)", buf);
+    else
+        printf("  --    %-22s not installed\n", "agent (Cursor)");
 
     if (paths_mkdirs(&c->p, err, sizeof err) == 0)
         bad += check(1, "runtime directory", c->p.rundir);
@@ -97,7 +102,7 @@ static const char BASH_COMPLETION[] =
     "# nuq completion for bash. Load with:  eval \"$(nuq completion bash)\"\n"
     "_nuq() {\n"
     "    local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
-    "    local cmds=\"claude codex run send pub sub unsub push take done fail inbox listen show ls tail work attach kill nuke up doctor completion skills version help\"\n"
+    "    local cmds=\"claude codex pi agent devin run send pub sub unsub push take done fail inbox listen show ls tail work attach kill nuke up doctor completion skills version help\"\n"
     "    if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
     "        COMPREPLY=($(compgen -W \"$cmds\" -- \"$cur\"))\n"
     "        return\n"
@@ -140,6 +145,9 @@ static const char ZSH_COMPLETION[] =
     "    cmds=(\n"
     "        'claude:start Claude Code in the grid'\n"
     "        'codex:start Codex in the grid'\n"
+    "        'pi:start Pi in the grid'\n"
+    "        'agent:start Cursor in the grid'\n"
+    "        'devin:start Devin in the grid'\n"
     "        'run:start any command as an agent'\n"
     "        'send:send to @name, several, or @all'\n"
     "        'pub:publish to a topic'\n"
@@ -183,7 +191,7 @@ static const char ZSH_COMPLETION[] =
     "    skills) compadd status install show ;;\n"
     "    inbox) compadd -- --peek ;;\n"
     "    work) compadd -- --all ;;\n"
-    "    claude|codex|run) _normal ;;\n"
+    "    claude|codex|pi|agent|devin|run) _normal ;;\n"
     "    esac\n"
     "}\n"
     "if [ \"${funcstack[1]}\" = _nuq ]; then\n"
@@ -201,7 +209,7 @@ static const char POWERSHELL_COMPLETION[] =
     "    $w = @($ast.CommandElements | ForEach-Object { $_.ToString() })\n"
     "    $n = if ($word) { $w.Count - 1 } else { $w.Count }\n"
     "    $list = if ($n -le 1) {\n"
-    "        'claude codex run send pub sub unsub push take done fail inbox listen show ls tail work attach kill nuke up doctor completion skills version help' -split ' '\n"
+    "        'claude codex pi agent devin run send pub sub unsub push take done fail inbox listen show ls tail work attach kill nuke up doctor completion skills version help' -split ' '\n"
     "    } else {\n"
     "        switch ($w[1]) {\n"
     "            'send' { if ($n -eq 2) { @('@all') + @(nuq ls 2>$null | Select-Object -Skip 1 | ForEach-Object { $f = -split $_; if ($f.Count -ge 6) { '@' + $f[0] } }) } }\n"
@@ -257,6 +265,9 @@ static const struct {
 } SKILL_HOMES[] = {
     {"Claude Code", "CLAUDE_CONFIG_DIR", ".claude"},
     {"Codex", "CODEX_HOME", ".codex"},
+    {"Pi", "PI_CODING_AGENT_DIR", ".pi/agent"},
+    {"Cursor", "CURSOR_CONFIG_DIR", ".cursor"},
+    {"Devin", NULL, ".config/devin"},
 };
 #define N_SKILL_HOMES (sizeof SKILL_HOMES / sizeof SKILL_HOMES[0])
 
@@ -264,7 +275,7 @@ static const struct {
 static char *skills_dir_of(size_t i)
 {
     sb_t root = {0};
-    const char *over = getenv(SKILL_HOMES[i].env), *home = nq_home();
+    const char *over = SKILL_HOMES[i].env ? getenv(SKILL_HOMES[i].env) : NULL, *home = nq_home();
     if (over && *over)
         sb_adds(&root, over);
     else if (home && *home)
@@ -395,7 +406,8 @@ int cmd_skills(nq_ctx *c, int argc, char **argv)
             }
         }
         if (!done) {
-            nq_warn("no agent configuration found (looked for ~/.claude and ~/.codex)\n"
+            nq_warn("no agent configuration found (looked for ~/.claude, ~/.codex, ~/.pi/agent,\n"
+                    "  ~/.cursor and ~/.config/devin)\n"
                     "  to install somewhere else: nuq skills install --dir SKILLS_DIR");
             return 1;
         }

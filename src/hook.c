@@ -11,7 +11,8 @@
 #include "proto.h"
 #include "util.h"
 
-/* `nuq hook <agent> <event>` is what the agents' hook systems run.
+/* `nuq hook <agent> <event>` is what the agents' hook systems run. Pi has
+ * extensions instead of hooks; nuq's own (pi_extension.ts) runs this too.
  *
  * Rules: it must be quick, it must never fail the agent (exit 0 and print
  * nothing on error), and it must do nothing when the broker is gone. The
@@ -81,8 +82,11 @@ static cJSON *tool_activity(const cJSON *in)
     cJSON *extra = cJSON_CreateObject();
     cJSON_AddStringToObject(extra, "tool", tool);
     cJSON *edits = cJSON_CreateArray();
-    if (proto_edit_stats(tool, cJSON_GetObjectItemCaseSensitive(in, "tool_input"),
-                         cJSON_GetObjectItemCaseSensitive(in, "tool_response"), edits) > 0)
+    const cJSON *response = cJSON_GetObjectItemCaseSensitive(in, "tool_response");
+    /* Devin reports a tool that failed, too: {"success": false}. */
+    int failed = cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(response, "success"));
+    if (!failed &&
+        proto_edit_stats(tool, cJSON_GetObjectItemCaseSensitive(in, "tool_input"), response, edits) > 0)
         cJSON_AddItemToObject(extra, "edits", edits);
     else
         cJSON_Delete(edits);
@@ -108,14 +112,21 @@ static void emit_context(const char *event, const char *text)
     print_json(o);
 }
 
-static void emit_bootstrap(const nq_ctx *c, const char *event)
+/* The introduction to the grid. Caller frees. */
+static char *bootstrap_text(const nq_ctx *c)
 {
     cJSON *ls = cli_rpc(c, cli_req("ls"), HOOK_TIMEOUT_MS);
     sb_t text = {0};
     adapter_bootstrap(&text, c->me, ls ? cJSON_GetObjectItemCaseSensitive(ls, "agents") : NULL);
-    emit_context(event, text.p);
-    sb_free(&text);
     cJSON_Delete(ls);
+    return text.p;
+}
+
+static void emit_bootstrap(const nq_ctx *c, const char *event)
+{
+    char *text = bootstrap_text(c);
+    emit_context(event, text);
+    free(text);
 }
 
 static void emit_mail(const char *event, char *mail)
@@ -201,8 +212,59 @@ static int wait_for_mail(const nq_ctx *c)
     return rc;
 }
 
+/* ---- Cursor ------------------------------------------------------------ */
+
+/* {"<key>": "<lead><text>"}, the flat reply Cursor's hooks give. Frees text. */
+static void emit_cursor(const char *key, const char *lead, char *text)
+{
+    if (!text) return;
+    sb_t all = {0};
+    sb_addf(&all, "%s%s", lead, text);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, key, all.p);
+    print_json(o);
+    sb_free(&all);
+    free(text);
+}
+
+/* Cursor's CLI has its own event names, input and replies. */
+static int cursor_event(const nq_ctx *c, const char *event, const cJSON *in)
+{
+    if (!strcmp(event, "sessionStart")) {
+        free(exchange(c, "idle", 0, 0));
+        emit_cursor("additional_context", "", bootstrap_text(c));
+    } else if (!strcmp(event, "beforeSubmitPrompt")) {
+        /* This hook cannot add to the prompt, so the mail is left for the
+         * next postToolUse or stop. */
+        free(exchange(c, "busy", 0, 0));
+    } else if (!strcmp(event, "postToolUse")) {
+        /* Only the tool's name: its edits come with afterFileEdit. */
+        const char *tool = jstr(in, "tool_name");
+        cJSON *extra = cJSON_CreateObject();
+        if (tool) cJSON_AddStringToObject(extra, "tool", tool);
+        emit_cursor("additional_context", "New nuq messages:\n\n", exchange_with(c, "busy", 1, 0, extra));
+    } else if (!strcmp(event, "afterFileEdit")) {
+        /* {file_path, edits: [{old_string, new_string}]}: Claude's MultiEdit. */
+        cJSON *extra = cJSON_CreateObject(), *edits = cJSON_CreateArray();
+        proto_edit_stats("MultiEdit", in, NULL, edits);
+        cJSON_AddItemToObject(extra, "edits", edits);
+        free(exchange_with(c, NULL, 0, 0, extra));
+    } else if (!strcmp(event, "stop")) {
+        /* A turn that was interrupted or failed takes no follow-up; mail
+         * that is waiting is then pasted to the idle agent instead. */
+        const char *status = jstr(in, "status");
+        if (status && strcmp(status, "completed"))
+            free(exchange(c, "idle", 0, 0));
+        else
+            emit_cursor("followup_message", "nuq messages arrived while you were working:\n\n",
+                        exchange(c, "idle", 1, 1));
+    }
+    return 0;
+}
+
 /* Claude Code and Codex use the same event names and the same JSON in both
- * directions for the events handled here. */
+ * directions for the events handled here. Devin reads Claude's format, and
+ * the Pi extension speaks it too. */
 static int hook_event(const nq_ctx *c, const char *event, const cJSON *in)
 {
     /* Events raised inside a subagent belong to that subagent's context;
@@ -252,7 +314,11 @@ int cmd_hook(nq_ctx *c, int argc, char **argv)
         free(text);
     }
     int rc = 0;
-    if (!strcmp(argv[0], "claude") || !strcmp(argv[0], "codex")) rc = hook_event(c, argv[1], in);
+    if (!strcmp(argv[0], "claude") || !strcmp(argv[0], "codex") || !strcmp(argv[0], "pi") ||
+        !strcmp(argv[0], "devin"))
+        rc = hook_event(c, argv[1], in);
+    else if (!strcmp(argv[0], "cursor"))
+        rc = cursor_event(c, argv[1], in);
     cJSON_Delete(in);
     fflush(stdout);
     return rc;

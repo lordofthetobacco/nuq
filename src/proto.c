@@ -223,12 +223,22 @@ static const char *find_patch(const cJSON *v)
     return NULL;
 }
 
+/* One {old_string, new_string} replacement; Pi names them oldText, newText. */
+static void replacement_count(const cJSON *r, long *added, long *removed)
+{
+    const char *old = jstr(r, "old_string"), *new_ = jstr(r, "new_string");
+    if (!old) old = jstr(r, "oldText");
+    if (!new_) new_ = jstr(r, "newText");
+    if (old || new_) diff_count(old, new_, added, removed);
+}
+
 int proto_edit_stats(const char *tool, const cJSON *input, const cJSON *response, cJSON *out)
 {
     int before = cJSON_GetArraySize(out);
     if (!tool) tool = "";
     const char *file = jstr(input, "file_path");
     if (!file) file = jstr(response, "filePath");
+    if (!file) file = jstr(input, "path"); /* Pi */
 
     /* Claude reports the actual change it made. */
     const cJSON *patch = cJSON_GetObjectItemCaseSensitive(response, "structuredPatch");
@@ -245,17 +255,16 @@ int proto_edit_stats(const char *tool, const cJSON *input, const cJSON *response
             }
         }
         add_stat(out, file, added, removed);
-    } else if (!strcmp(tool, "Write")) {
+    } else if (!strcmp(tool, "Write") || !strcmp(tool, "write")) {
         add_stat(out, file, count_lines(jstr(input, "content")), 0);
-    } else if (!strcmp(tool, "Edit")) {
-        long added = 0, removed = 0;
-        diff_count(jstr(input, "old_string"), jstr(input, "new_string"), &added, &removed);
-        add_stat(out, file, added, removed);
-    } else if (!strcmp(tool, "MultiEdit")) {
+    } else if (!strcmp(tool, "Edit") || !strcmp(tool, "MultiEdit") || !strcmp(tool, "edit")) {
+        /* One replacement in the input itself (Claude's Edit), or a list of
+         * them (MultiEdit, Cursor's afterFileEdit, the edit tool of Pi). */
         long added = 0, removed = 0;
         const cJSON *e;
+        replacement_count(input, &added, &removed);
         cJSON_ArrayForEach(e, cJSON_GetObjectItemCaseSensitive(input, "edits"))
-        diff_count(jstr(e, "old_string"), jstr(e, "new_string"), &added, &removed);
+        replacement_count(e, &added, &removed);
         add_stat(out, file, added, removed);
     } else {
         const char *p = find_patch(input);

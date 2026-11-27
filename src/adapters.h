@@ -6,7 +6,8 @@
 #include "util.h"
 
 /* What nuq knows about each kind of agent: how its messages are
- * delivered and which extra arguments wire its hooks to `nuq hook`.
+ * delivered and which extra arguments wire its hooks (for Pi, an extension)
+ * to `nuq hook`.
  * Anything not listed is "generic": started as given, no hooks. */
 
 /* MODE_* for a kind. `inject` is the --inject flag (generic agents only). */
