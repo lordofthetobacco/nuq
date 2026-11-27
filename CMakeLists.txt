@@ -8,11 +8,26 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(NUQ_SYSTEM_NNG "Link an installed NNG 2.x instead of building the pinned copy" OFF)
 option(NUQ_SANITIZE "Build nuq with AddressSanitizer and UBSan" OFF)
 option(NUQ_TESTS "Build the test suite" ON)
-# The release workflow passes the version it is about to tag. Anything else
-# reports the project version above.
-set(NUQ_VERSION "" CACHE STRING "Version nuq reports instead of the project version")
+# The release workflow passes the version it is about to tag. Any other build
+# names the commit it was configured at (0.1.1-3-g7f52653, with -dirty for
+# uncommitted changes), so it cannot be taken for a released binary. Without
+# git or tags it reports the project version above with -dev.
+set(NUQ_VERSION "" CACHE STRING "Version nuq reports instead of the one git describes")
 if(NOT NUQ_VERSION)
-  set(NUQ_VERSION "${PROJECT_VERSION}")
+  set(NUQ_VERSION "${PROJECT_VERSION}-dev")
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} describe --tags --match "v[0-9]*" --dirty
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE NQ_GIT_DESCRIBE
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      RESULT_VARIABLE NQ_GIT_DESCRIBE_RESULT)
+    if(NQ_GIT_DESCRIBE_RESULT EQUAL 0 AND NQ_GIT_DESCRIBE MATCHES "^v[0-9]")
+      string(SUBSTRING "${NQ_GIT_DESCRIBE}" 1 -1 NUQ_VERSION)
+    endif()
+  endif()
 endif()
 
 # Windows: link the C runtime statically, so nuq.exe runs on machines without

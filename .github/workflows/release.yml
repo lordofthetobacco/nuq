@@ -1,6 +1,7 @@
 name: release
 
-# Tests main and publishes the nuq packages as a GitHub release.
+# Tests main, publishes the nuq packages as a GitHub release and points the
+# Homebrew tap at them.
 #
 #   push to main                     run ci; if it passes and anything that
 #                                    ends up in the binary changed since the
@@ -10,6 +11,12 @@ name: release
 #   run by hand on another branch,   dry run: the packages are built and
 #   or a pull request touching the   kept as workflow artifacts, nothing is
 #   build or this file               tagged or published
+#
+# Homebrew: every run installs the formula for its packages with brew. A
+# release then writes that formula to the tap, so `brew upgrade` gets the
+# release without anyone editing the tap. The push uses a deploy key of the
+# tap that has write access; its private half is the secret
+# HOMEBREW_TAP_DEPLOY_KEY of this repository.
 #
 # Versions: the next release is the latest vX.Y.Z tag with Z raised by one.
 # To start a new minor or major line, raise the version in CMakeLists.txt
@@ -28,6 +35,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/scripts/**
       - CMakeLists.txt
       - CMakePresets.json
       - cmake/**
@@ -37,6 +45,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  TAP: lordofthetobacco/homebrew-tap
 
 # One run at a time on main, so two releases never pick the same version.
 concurrency:
@@ -129,10 +140,11 @@ jobs:
           - os: ubuntu-22.04-arm
             target: linux-aarch64
             preset: release
+          # Apple silicon only: macos-latest is an arm64 runner.
           - os: macos-latest
-            target: macos-universal
+            target: macos-arm64
             preset: release
-            cmake_args: '"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0'
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
           - os: windows-latest
             target: windows-x86_64
             preset: windows-release
@@ -171,6 +183,9 @@ jobs:
         run: |
           set -euo pipefail
           [ "$("$BUILD/nuq" version)" = "nuq $VERSION" ] || { echo "::error::nuq does not report $VERSION"; exit 1; }
+          if [ "$RUNNER_OS" = macOS ]; then
+              [ "$(lipo -archs "$BUILD/nuq")" = arm64 ] || { echo "::error::nuq is not an arm64 binary"; exit 1; }
+          fi
           cmake --install "$BUILD" --prefix "stage/$NAME" --strip
           mkdir "stage/$NAME/LICENSES"
           cp third_party/cjson/LICENSE "stage/$NAME/LICENSES/cJSON.txt"
@@ -245,3 +260,100 @@ jobs:
           --target "$GITHUB_SHA"
           --title "nuq ${TAG#v}"
           --generate-notes
+
+  # The Homebrew formula for these packages, installed with brew on macOS
+  # and Linux. A dry run takes the packages from this run; a release
+  # downloads them from the release it has just published, the way a user's
+  # brew will.
+  formula:
+    needs: [version, package, publish]
+    if: >-
+      !cancelled() && needs.package.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      # The Linux runners come with Homebrew, but not on PATH.
+      - name: Find brew (Linux)
+        if: runner.os == 'Linux'
+        run: echo /home/linuxbrew/.linuxbrew/bin >>"$GITHUB_PATH"
+      - name: Write the formula
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 nuq-*) >SHA256SUMS
+          if [ "$PUBLISH" = true ]; then
+              .github/scripts/homebrew-formula.sh "$VERSION" SHA256SUMS >nuq.rb
+          else
+              .github/scripts/homebrew-formula.sh "$VERSION" SHA256SUMS "file://$PWD/dist" >nuq.rb
+          fi
+          cat nuq.rb
+      # brew installs formulae only from a tap, and a tap that is not
+      # Homebrew's own only once it is trusted.
+      - name: Install it with brew
+        run: |
+          set -euo pipefail
+          brew update
+          tap="$(brew --repository)/Library/Taps/nuq/homebrew-scratch"
+          mkdir -p "$tap/Formula"
+          cp nuq.rb "$tap/Formula/nuq.rb"
+          brew trust nuq/scratch
+          brew install nuq/scratch/nuq
+          brew test nuq/scratch/nuq
+          reported=$("$(brew --prefix)/bin/nuq" version)
+          [ "$reported" = "nuq $VERSION" ] || { echo "::error::brew installed '$reported', not nuq $VERSION"; exit 1; }
+
+  # Point the tap at the release.
+  tap:
+    needs: [version, formula]
+    if: >-
+      !cancelled() && needs.formula.result == 'success' &&
+      needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check the deploy key
+        env:
+          KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo "::error::The secret HOMEBREW_TAP_DEPLOY_KEY is not set, so $TAP still has the previous release"; exit 1; }
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.TAP }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Write the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS
+          .github/scripts/homebrew-formula.sh "$VERSION" SHA256SUMS >tap/Formula/nuq.rb
+      - name: Push it
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git add Formula/nuq.rb
+          if git diff --cached --quiet; then
+              echo "$TAP already has nuq $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "nuq $VERSION"
+          git push origin HEAD:main
+          echo "$TAP now has nuq $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
