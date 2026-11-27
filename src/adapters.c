@@ -13,9 +13,9 @@
 int adapter_mode(const char *kind, int inject)
 {
     if (!strcmp(kind, "claude")) return MODE_WAKE;
-    /* Pi's extension delivers mail itself, idle or busy. The wake line is
-     * only the fallback for a Pi that runs without it. */
-    if (!strcmp(kind, "pi")) return MODE_WAKE;
+    /* Pi's extension owns delivery, including the interval before its
+     * background waiter registers. A wake line could land in a draft. */
+    if (!strcmp(kind, "pi")) return MODE_PULL;
     /* Codex has hooks for state and mid-turn mail but no way to wake an idle
      * session, so idle delivery is a paste of the messages themselves. */
     if (!strcmp(kind, "codex")) return MODE_PASTE;
